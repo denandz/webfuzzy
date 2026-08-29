@@ -31,6 +31,7 @@ pub struct DbscanResult {
     pub noise_count: usize,
 }
 
+/// Categorical features - currently just status code
 const IANA_STATUS_CODES: &[u16] = &[
     100, 101, 102, 103, 104, 200, 201, 202, 203, 204, 205, 206, 207, 208, 226, 300, 301, 302, 303,
     304, 305, 306, 307, 308, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413,
@@ -42,9 +43,10 @@ const NUM_STATUS_CODES: usize = IANA_STATUS_CODES.len();
 const UNKNOWN_COL: usize = NUM_STATUS_CODES;
 const NUM_STATUS_FEATURES: usize = NUM_STATUS_CODES + 1;
 
-const CONTINUOUS_FEATURES: usize = 5;
+/// Number of continuous features - length, ttfb, words, lines
+const CONTINUOUS_FEATURES: usize = 4;
 /// Number of continuous features when timing analysis is disabled (TTFB excluded).
-const CONTINUOUS_FEATURES_NO_TIMING: usize = 4;
+const CONTINUOUS_FEATURES_NO_TIMING: usize = 3;
 /// Offset of the first continuous column relative to `NUM_STATUS_FEATURES`.
 ///
 /// Continuous columns are laid out densely (length, [ttfb], words, lines,
@@ -185,9 +187,7 @@ pub fn perform_clustering(
     }
 }
 
-/// Fuzzing-stage payloads for display: sample payloads from the cluster,
-/// excluding baseline entries (the first `n_baseline` features, which carry
-/// the original parameter value rather than a fuzz payload).
+/// Sample payloads from a cluster
 fn collect_sample_payloads(
     indices: &[usize],
     features: &[ResponseFeatures],
@@ -200,6 +200,7 @@ fn collect_sample_payloads(
         .collect()
 }
 
+/// turn ResponseFeatures into an feature matrix
 fn features_to_array(
     features: &[ResponseFeatures],
     include_timing: bool,
@@ -231,9 +232,6 @@ fn features_to_array(
         data[[i, col]] = feature.response_words as f64;
         col += 1;
         data[[i, col]] = feature.response_lines as f64;
-        col += 1;
-       // data[[i, col]] = feature.content_length_minus_payload as f64;
-        data[[i, col]] = 0 as f64;
         original_indices.push(i);
     }
 
@@ -303,14 +301,12 @@ fn find_representative(
             centroid.avg_ttfb_ms,
             centroid.avg_response_words,
             centroid.avg_response_lines,
-            centroid.avg_content_length_minus_payload,
         ]
     } else {
         vec![
             centroid.avg_response_length,
             centroid.avg_response_words,
             centroid.avg_response_lines,
-            centroid.avg_content_length_minus_payload,
         ]
     };
 

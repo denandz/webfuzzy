@@ -11,6 +11,7 @@ use crate::http_client::{HttpRequest, HttpResponse, RequestResult};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditLog {
+    pub summary: ScanSummary,
     pub version: String,
     pub scan_info: ScanInfo,
     pub baseline: Option<BaselineResult>,
@@ -173,6 +174,7 @@ impl AuditLogger {
         };
 
         let audit_log = AuditLog {
+            summary,
             version: env!("CARGO_PKG_VERSION").to_string(),
             scan_info: scan_info.clone(),
             baseline: Some(baseline.clone()),

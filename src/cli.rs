@@ -49,7 +49,7 @@ pub struct Args {
     pub marker: String,
 
     /// Number of concurrent requests for fuzzing (lower values improve timing analysis accuracy)
-    #[arg(long, default_value = "1")]
+    #[arg(long, default_value = "5")]
     pub threads: usize,
 
     /// Request timeout in seconds
