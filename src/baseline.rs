@@ -38,15 +38,16 @@ pub async fn run_baseline(
         });
     }
 
-    let headers = args.parse_headers();
+    // The baseline exercises the original request: every marker span
+    // (§...§) - in the URL, body, or header keys/values - is collapsed
+    // to its inner content, so no markers are sent.
+    let headers = marker::collapse_headers(&args.parse_headers(), &args.marker.as_bytes());
     let marker_bytes = args.marker.as_bytes().to_vec();
 
-    // The baseline exercises the original request: every marker span
-    // (§...§) is collapsed to its inner content, so no markers are sent.
     let body: Option<Vec<u8>> = args
         .data
         .as_ref()
-        .map(|s| crate::marker::collapse_spans(s.as_bytes(), &marker_bytes));
+        .map(|s| marker::collapse_spans(s.as_bytes(), &marker_bytes));
 
     // The original value inside the first span (URL or body) is what the
     // baseline "injects"; record its byte length so feature extraction can
@@ -59,6 +60,14 @@ pub async fn run_baseline(
             args.data
                 .as_ref()
                 .and_then(|d| marker::first_span_value(d.as_bytes(), &marker_bytes))
+        })
+        .or_else(|| {
+            headers
+                .iter()
+                .find_map(|(k, v)| {
+                    marker::first_span_value(k.as_bytes(), &marker_bytes)
+                        .or_else(|| marker::first_span_value(v.as_bytes(), &marker_bytes))
+                })
         })
         .map(|span| span.len())
         .unwrap_or(0);

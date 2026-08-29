@@ -16,7 +16,9 @@ pub struct Args {
     #[arg(short, long, required = true)]
     pub url: Option<String>,
 
-    /// HTTP headers in format 'Name: Value' (repeatable)
+    /// HTTP headers in format 'Name: Value' (repeatable). Wrap the original
+    /// value in marker pairs to fuzz it, in the key ('§X-Api§-Key: v') and/or
+    /// the value ('X-Api-Key: §key§').
     #[arg(short = 'H', long = "header", action = clap::ArgAction::Append)]
     pub headers: Vec<String>,
 

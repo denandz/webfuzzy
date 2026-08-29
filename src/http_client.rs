@@ -168,7 +168,13 @@ impl HttpClient {
         // spaces, etc.) while keeping the path raw (no dot-segment normalization).
         let uri = match build_uri(url) {
             Ok(uri) => uri,
-            Err(e) => return Err((request, e.to_string())),
+            Err(e) => {
+                // The attempt never reaches the wire; still log it so the
+                // audit trail covers every payload.
+                self.audit_logger.log_request(&request);
+                self.audit_logger.log_error(&request.request_id, &e);
+                return Err((request, e));
+            }
         };
 
         request.url = uri.to_string();
@@ -176,6 +182,10 @@ impl HttpClient {
         let mut builder = Request::builder().method(method).uri(uri.clone());
 
         for (name, value) in headers {
+            // Invalid names (non-token bytes) bung up the builder so the
+            // request fails at .body() and is logged as a failure.
+            // Invalid values (CR/LF), which the `http` crate rejects by
+            // construction
             builder = builder.header(
                 name.as_str(),
                 hyper::header::HeaderValue::from_bytes(value.as_bytes()).unwrap_or_else(|_| {
@@ -194,7 +204,10 @@ impl HttpClient {
             );
         }
 
-        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent")) {
+        if !headers
+            .iter()
+            .any(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+        {
             builder = builder.header(
                 "User-Agent",
                 format!("webfuzzy/{}", env!("CARGO_PKG_VERSION")),
@@ -205,7 +218,12 @@ impl HttpClient {
         let body_bytes: Vec<u8> = body.unwrap_or(&[]).to_vec();
         let hyper_req = match builder.body(Full::from(Bytes::from(body_bytes))) {
             Ok(hyper_req) => hyper_req,
-            Err(e) => return Err((request, e.to_string())),
+            Err(e) => {
+                let err = e.to_string();
+                self.audit_logger.log_request(&request);
+                self.audit_logger.log_error(&request.request_id, &err);
+                return Err((request, err));
+            }
         };
 
         // Read the final headers back from the hyper request so the audit
@@ -217,38 +235,26 @@ impl HttpClient {
 
         let start = Instant::now();
 
-        // Execute with timeout
-        let response_result = tokio::time::timeout(
-            Duration::from_secs(self.args.timeout),
-            self.client.request(hyper_req),
-        )
+        // A single deadline bounds the ENTIRE request: connect + TLS +
+        // response headers + full body.
+        let outcome = tokio::time::timeout(Duration::from_secs(self.args.timeout), async {
+            let response = match self.client.request(hyper_req).await {
+                Ok(response) => response,
+                Err(e) => return Err(e.to_string()),
+            };
+            let ttfb = start.elapsed();
+            let status_code = response.status().as_u16();
+            let response_headers = extract_headers(response.headers());
+            let collected = match response.into_body().collect().await {
+                Ok(collected) => collected,
+                Err(e) => return Err(e.to_string()),
+            };
+            Ok((status_code, response_headers, collected, ttfb))
+        })
         .await;
 
-        let ttfb = start.elapsed();
-
-        let response_result: Result<
-            hyper::Response<hyper::body::Incoming>,
-            hyper_util::client::legacy::Error,
-        > = match response_result {
-            Ok(Ok(res)) => Ok(res),
-            Ok(Err(e)) => Err(e),
-            Err(_) => {
-                let io_err = std::io::Error::new(std::io::ErrorKind::TimedOut, "timeout");
-                return Err((request, io_err.to_string()))
-            }
-        };
-
-        match response_result {
-            Ok(response) => {
-                let status_code = response.status().as_u16();
-
-                let response_headers = extract_headers(response.headers());
-
-                // Collect body bytes
-                let collected = match response.into_body().collect().await {
-                    Ok(collected) => collected,
-                    Err(e) => return Err((request, e.to_string())),
-                };
+        match outcome {
+            Ok(Ok((status_code, response_headers, collected, ttfb))) => {
                 let response_text = String::from_utf8_lossy(&collected.to_bytes()).to_string();
                 let total_time = start.elapsed();
 
@@ -272,12 +278,21 @@ impl HttpClient {
 
                 Ok((request, response))
             }
-            Err(e) => {
-                let error_msg = e.to_string();
-
+            Ok(Err(error_msg)) => {
+                // Client error (connect/TLS/protocol) or body read error.
                 self.audit_logger.log_error(&request.request_id, &error_msg);
 
                 Err((request, error_msg))
+            }
+            Err(_) => {
+                // Timed out waiting for a complete response (headers or
+                // body). Payloads that hang the server are a key finding.
+                let err = format!(
+                    "timed out after {}s waiting for a complete response",
+                    self.args.timeout
+                );
+                self.audit_logger.log_error(&request.request_id, &err);
+                Err((request, err))
             }
         }
     }
@@ -346,12 +361,15 @@ fn build_uri(url: &str) -> Result<http::Uri, String> {
 /// values kept as their real bytes (lossy only for non-ASCII), duplicate
 /// names preserved. Sorted by name so the log is deterministic and
 /// duplicate entries sit adjacent.
-fn extract_headers(
-    headers: &http::HeaderMap<hyper::header::HeaderValue>,
-) -> Vec<(String, String)> {
+fn extract_headers(headers: &http::HeaderMap<hyper::header::HeaderValue>) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = headers
         .iter()
-        .map(|(k, v)| (k.to_string(), String::from_utf8_lossy(v.as_bytes()).to_string()))
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                String::from_utf8_lossy(v.as_bytes()).to_string(),
+            )
+        })
         .collect();
     out.sort();
     out

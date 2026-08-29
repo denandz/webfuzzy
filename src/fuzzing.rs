@@ -5,6 +5,7 @@ use tokio::sync::Semaphore;
 
 use crate::baseline::BaselineResult;
 use crate::cli::Args;
+use crate::marker;
 use crate::clustering::{self, DbscanResult};
 use crate::http_client::{HttpClient, RequestResult, ResponseFeatures};
 
@@ -55,34 +56,52 @@ pub async fn run_fuzzing(
     let marker_bytes = args.marker.as_bytes().to_vec();
     let body_template_bytes = args.data.as_ref().map(|s| s.as_bytes().to_vec());
 
-    // Fuzzing requires at least one marker span (§...§) in the URL or body
-    // template; without it there is nowhere to inject the payloads.
-    let url_has_span = crate::marker::has_span(url.as_bytes(), &marker_bytes);
+    // Fuzzing requires at least one marker span (§...§) in the URL, body,
+    // or a header key/value template; without it there is nowhere to
+    // inject the payloads.
+    let url_has_span = marker::has_span(url.as_bytes(), &marker_bytes);
     let body_has_span = body_template_bytes
         .as_ref()
-        .map_or(false, |b| crate::marker::has_span(b, &marker_bytes));
-    if !url_has_span && !body_has_span {
+        .map_or(false, |b| marker::has_span(b, &marker_bytes));
+    let header_has_span = marker::headers_have_span(&headers, &marker_bytes);
+    if !url_has_span && !body_has_span && !header_has_span {
         return Err(format!(
-            "no payload span found in URL or body: wrap the original parameter value in '{}' pairs, e.g. ?id=§1§",
+            "no payload span found in URL, body, or headers: wrap the original value in '{}' pairs, e.g. ?id=§1§ or -H 'X-Api-Key: §key§'",
             args.marker
         )
         .into());
     }
 
+    // NOTE: header key/value fuzzing and hyper's parsing logic.
+    // Payload bytes injected into headers are validated by the `http`
+    // crate when `send_request` builds the request:
+    // - A header NAME must be a valid RFC 9110 token (ASCII: letters,
+    //   digits, !#$%&'*+-.^_`|~). If a payload makes the key invalid,
+    //   `Request::builder` enters an error state and `.body()` fails, so
+    //   the request is never sent and is logged as a failure.
+    // - CR (0x0D) and LF (0x0A) are rejected
+    //   True CRLF injection would require a raw-socket client.
+    // Header names are lowercased on the wire (h2 requires it; hyper's
+    // h1 encoder emits the HeaderMap's normalized lowercase form).
+    // There are ways to have non-cannonicalized headers with h1, which is
+    // worth investigating https://github.com/hyperium/hyper/issues/1492
+
     if args.threads <= 1 {
         for (i, payload) in wordlist.iter().enumerate() {
             let payload_display = String::from_utf8_lossy(payload).to_string();
             let url_with_payload =
-                crate::marker::inject_span_str(&url, &args.marker, &payload_display);
+                marker::inject_span_str(&url, &args.marker, &payload_display);
             let body_bytes = body_template_bytes
                 .as_ref()
-                .map(|template| crate::marker::inject_span(template, &marker_bytes, payload));
+                .map(|template| marker::inject_span(template, &marker_bytes, payload));
+            let headers_with_payload =
+                marker::inject_headers(&headers, &marker_bytes, payload);
 
             let result = client
                 .send_request(
                     &url_with_payload,
                     &args.method,
-                    &headers,
+                    &headers_with_payload,
                     body_bytes.as_deref(),
                 )
                 .await;
@@ -147,16 +166,18 @@ pub async fn run_fuzzing(
             let handle = tokio::spawn(async move {
                 let payload_display = String::from_utf8_lossy(&payload_clone).to_string();
                 let url_with_payload =
-                    crate::marker::inject_span_str(&url, &marker_str, &payload_display);
+                    marker::inject_span_str(&url, &marker_str, &payload_display);
                 let body_bytes = body_template
                     .as_ref()
-                    .map(|template| crate::marker::inject_span(template, &marker, &payload_clone));
+                    .map(|template| marker::inject_span(template, &marker, &payload_clone));
+                let headers_with_payload =
+                    marker::inject_headers(&headers_clone, &marker, &payload_clone);
 
                 let result = client_clone
                     .send_request(
                         &url_with_payload,
                         &method,
-                        &headers_clone,
+                        &headers_with_payload,
                         body_bytes.as_deref(),
                     )
                     .await;
@@ -295,6 +316,7 @@ fn truncate_payload(s: &str, max: usize) -> String {
 }
 
 /// DBSCAN tolerance for outlier clustering (in z-scored feature space).
+/// This should probably be a cli argument with a sensible default...
 pub const CLUSTER_TOLERANCE: f64 = 0.5;
 /// DBSCAN min_samples for outlier clustering.
 pub const CLUSTER_MIN_SAMPLES: usize = 3;

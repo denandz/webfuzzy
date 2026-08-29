@@ -25,8 +25,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let audit_logger = AuditLogger::new(&args.output, &config.run_id);
     let http_client = HttpClient::new(args, audit_logger.clone())?;
 
-    let headers = args.parse_headers();
     // Probe with the original request (marker spans collapsed), like the baseline.
+    let headers =
+        webfuzzy::marker::collapse_headers(&args.parse_headers(), args.marker.as_bytes());
     let probe_body: Option<Vec<u8>> = args
         .data
         .as_ref()
