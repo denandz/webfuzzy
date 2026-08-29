@@ -46,8 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "Content-Type: {}",
                 response
                     .headers
-                    .get("content-type")
-                    .unwrap_or(&"unknown".to_string())
+                    .iter()
+                    .find(|(k, _)| k == "content-type")
+                    .map(|(_, v)| v.as_str())
+                    .unwrap_or("unknown")
             );
             println!("Length: {} bytes", response.body.len());
             println!("TTFB: {}ms", response.time_to_first_byte.as_millis());

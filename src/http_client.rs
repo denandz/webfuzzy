@@ -5,7 +5,6 @@ use hyper::body::Bytes;
 use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::TokioExecutor;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::{Duration, Instant};
 
@@ -17,7 +16,8 @@ pub struct HttpRequest {
     pub request_id: String,
     pub method: String,
     pub url: String,
-    pub headers: HashMap<String, String>,
+    /// Header pairs as sent (names lowercased, duplicates preserved).
+    pub headers: Vec<(String, String)>,
     pub body: Option<String>,
     pub timestamp: String,
 }
@@ -26,7 +26,8 @@ pub struct HttpRequest {
 pub struct HttpResponse {
     pub request_id: String,
     pub status_code: u16,
-    pub headers: HashMap<String, String>,
+    /// Header pairs as received (names lowercased, duplicates preserved).
+    pub headers: Vec<(String, String)>,
     pub body: String,
     pub content_length: usize,
     pub response_words: usize,
@@ -63,8 +64,9 @@ impl From<&HttpResponse> for ResponseFeatures {
             status_code: response.status_code,
             content_type: response
                 .headers
-                .get("content-type")
-                .cloned()
+                .iter()
+                .find(|(k, _)| k == "content-type")
+                .map(|(_, v)| v.clone())
                 .unwrap_or_default(),
             response_length: response.body.len(),
             time_to_first_byte_ms: response.time_to_first_byte.as_millis() as u64,
@@ -157,7 +159,7 @@ impl HttpClient {
             request_id: uuid::Uuid::new_v4().to_string(),
             method: method.to_string(),
             url: url.to_string(),
-            headers: headers.iter().cloned().collect(),
+            headers: headers.to_vec(),
             body: body.map(|b| String::from_utf8_lossy(b).to_string()),
             timestamp,
         };
@@ -173,7 +175,6 @@ impl HttpClient {
 
         let mut builder = Request::builder().method(method).uri(uri.clone());
 
-        let mut header_map: HashMap<String, String> = HashMap::new();
         for (name, value) in headers {
             builder = builder.header(
                 name.as_str(),
@@ -191,10 +192,9 @@ impl HttpClient {
                         .unwrap_or(hyper::header::HeaderValue::from_static(""))
                 }),
             );
-            header_map.insert(name.clone(), value.clone());
         }
 
-        if !header_map.contains_key("User-Agent") {
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("user-agent")) {
             builder = builder.header(
                 "User-Agent",
                 format!("webfuzzy/{}", env!("CARGO_PKG_VERSION")),
@@ -207,7 +207,12 @@ impl HttpClient {
             Ok(hyper_req) => hyper_req,
             Err(e) => return Err((request, e.to_string())),
         };
-        
+
+        // Read the final headers back from the hyper request so the audit
+        // log reflects what hyper will actually send: lowercased names,
+        // the webfuzzy User-Agent fallback, and any lossy value fallbacks.
+        request.headers = extract_headers(hyper_req.headers());
+
         self.audit_logger.log_request(&request);
 
         let start = Instant::now();
@@ -237,11 +242,7 @@ impl HttpClient {
             Ok(response) => {
                 let status_code = response.status().as_u16();
 
-                let response_headers: HashMap<String, String> = response
-                    .headers()
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
-                    .collect();
+                let response_headers = extract_headers(response.headers());
 
                 // Collect body bytes
                 let collected = match response.into_body().collect().await {
@@ -340,6 +341,22 @@ fn build_uri(url: &str) -> Result<http::Uri, String> {
     http::Uri::from_str(&uri_string).map_err(|e| format!("Invalid URI '{}': {}", uri_string, e))
 }
 
+/// Extract headers from a hyper request/response for logging: names
+/// lowercased (HeaderMap normalisation - what hyper writes to the wire),
+/// values kept as their real bytes (lossy only for non-ASCII), duplicate
+/// names preserved. Sorted by name so the log is deterministic and
+/// duplicate entries sit adjacent.
+fn extract_headers(
+    headers: &http::HeaderMap<hyper::header::HeaderValue>,
+) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = headers
+        .iter()
+        .map(|(k, v)| (k.to_string(), String::from_utf8_lossy(v.as_bytes()).to_string()))
+        .collect();
+    out.sort();
+    out
+}
+
 /// No-op certificate verifier for insecure mode.
 #[derive(Debug)]
 struct NoVerifier {}
@@ -419,6 +436,35 @@ mod tests {
     fn fragment_hash_in_query_is_encoded_not_dropped() {
         let uri = build_uri("http://example.com/?a=1#x").unwrap();
         assert_eq!(uri.to_string(), "http://example.com/?a=1%23x");
+    }
+
+    #[test]
+    fn extract_headers_lowercases_and_preserves_bytes() {
+        let mut map = http::HeaderMap::new();
+        map.append(
+            "X-Mixed-Case",
+            hyper::header::HeaderValue::from_static("v1"),
+        );
+        map.append(
+            "x-mixed-case",
+            hyper::header::HeaderValue::from_static("v2"),
+        );
+        // non-ASCII value bytes (0xC2 0xA7 = §) must survive, not blank out
+        map.append(
+            "X-Bin",
+            hyper::header::HeaderValue::from_bytes(&[0xC2, 0xA7]).unwrap(),
+        );
+        let out = extract_headers(&map);
+        // names lowercased; duplicate name preserved (both values, adjacent);
+        // sorted by name
+        assert_eq!(
+            out,
+            vec![
+                ("x-bin".to_string(), "\u{00A7}".to_string()),
+                ("x-mixed-case".to_string(), "v1".to_string()),
+                ("x-mixed-case".to_string(), "v2".to_string()),
+            ]
+        );
     }
 
     #[test]
