@@ -1,7 +1,7 @@
 use linfa::prelude::*;
 use linfa_clustering::Dbscan;
 use ndarray::Array2;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use crate::http_client::ResponseFeatures;
 
@@ -31,55 +31,29 @@ pub struct DbscanResult {
     pub noise_count: usize,
 }
 
-/// Categorical features - currently just status code
-const IANA_STATUS_CODES: &[u16] = &[
-    100, 101, 102, 103, 104, 200, 201, 202, 203, 204, 205, 206, 207, 208, 226, 300, 301, 302, 303,
-    304, 305, 306, 307, 308, 400, 401, 402, 403, 404, 405, 406, 407, 408, 409, 410, 411, 412, 413,
-    414, 415, 416, 417, 418, 421, 422, 423, 424, 425, 426, 428, 429, 431, 451, 500, 501, 502, 503,
-    504, 505, 506, 507, 508, 510, 511,
-];
-
-const NUM_STATUS_CODES: usize = IANA_STATUS_CODES.len();
-const UNKNOWN_COL: usize = NUM_STATUS_CODES;
-const NUM_STATUS_FEATURES: usize = NUM_STATUS_CODES + 1;
-
 /// Number of continuous features - length, ttfb, words, lines
 const CONTINUOUS_FEATURES: usize = 4;
 /// Number of continuous features when timing analysis is disabled (TTFB excluded).
 const CONTINUOUS_FEATURES_NO_TIMING: usize = 3;
-/// Offset of the first continuous column relative to `NUM_STATUS_FEATURES`.
-///
-/// Continuous columns are laid out densely (length, [ttfb], words, lines,
-/// clmp); the TTFB column is omitted when timing analysis is disabled, so
-/// only the first offset is a fixed constant.
-const COL_LENGTH: usize = 0;
-
-fn status_one_hot_index(code: u16) -> usize {
-    match IANA_STATUS_CODES.binary_search(&code) {
-        Ok(i) => i,
-        Err(_) => UNKNOWN_COL,
-    }
-}
 
 /// Feature scaler using StandardScaler (z-score: (value - mean) / std).
 /// Chosen over log1p because DBSCAN's fixed tolerance needs a consistent
-/// statistical scale (radius = ~1 sigma), and z-score keeps extreme responses
-/// far from the bulk so anomalies are flagged as noise. Log1p compresses
-/// large values, pulling outliers toward the main cluster and
-/// causing false negatives.
+/// scale, and z-score keeps extreme responses far from the bulk so
+/// anomalies are flagged as noise; log1p pulls outliers toward the main
+/// cluster.
 struct Scaler {
     mean: Vec<f64>,
     std: Vec<f64>,
 }
 
 impl Scaler {
-    fn fit(data: &Array2<f64>, n_status: usize) -> Self {
+    fn fit(data: &Array2<f64>) -> Self {
         let ncols = data.ncols();
         let nrows = data.nrows() as f64;
         let mut mean = vec![0.0f64; ncols];
         let mut std = vec![0.0f64; ncols];
 
-        for j in n_status..ncols {
+        for j in 0..ncols {
             let col_sum: f64 = data.column(j).sum();
             mean[j] = col_sum / nrows;
             let var_sum: f64 = data.column(j).iter().map(|&v| (v - mean[j]).powi(2)).sum();
@@ -89,9 +63,9 @@ impl Scaler {
         Scaler { mean, std }
     }
 
-    fn transform(&self, data: &mut Array2<f64>, n_status: usize) {
+    fn transform(&self, data: &mut Array2<f64>) {
         let ncols = data.ncols();
-        for j in n_status..ncols {
+        for j in 0..ncols {
             if self.std[j] == 0.0 {
                 for i in 0..data.nrows() {
                     data[[i, j]] = 0.0;
@@ -120,65 +94,93 @@ pub fn perform_clustering(
         };
     }
 
-    let (mut data, original_indices) = features_to_array(features, include_timing);
-
-    let scaler = Scaler::fit(&data, NUM_STATUS_FEATURES);
-    scaler.transform(&mut data, NUM_STATUS_FEATURES);
-
-    let dataset = DatasetBase::from(data);
-
-    let cluster_memberships = Dbscan::params(min_samples)
-        .tolerance(tolerance)
-        .transform(dataset)
-        .expect("DBSCAN clustering failed");
-
-    let mut cluster_map: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut outliers = Vec::new();
-
-    for (i, cluster_id) in cluster_memberships.targets().iter().enumerate() {
-        match cluster_id {
-            None => {
-                outliers.push(original_indices[i]);
-            }
-            Some(id) => {
-                cluster_map
-                    .entry(*id)
-                    .or_default()
-                    .push(original_indices[i]);
-            }
-        }
-    }
-
-    let mut cluster_results: Vec<(usize, Vec<usize>)> = cluster_map.into_iter().collect();
-    cluster_results.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
-
-    if cluster_results.len() > max_clusters {
-        let excess = cluster_results.split_off(max_clusters);
-        for (_, indices) in excess {
-            outliers.extend(indices);
-        }
-        outliers.sort();
-    }
-
-    let noise_count = outliers.len();
+    // Cluster per HTTP status code in it's own scaled space: a 400s
+    // response length must not influence the distance between 200s.
+    // Groups hold global feature indices and BTree map means deterministic
+    // status order.
+    let features_by_status: BTreeMap<u16, Vec<usize>> = features
+        .iter()
+        .enumerate()
+        .fold(BTreeMap::new(), |mut acc, (i, f)| {
+            acc.entry(f.status_code).or_default().push(i);
+            acc
+        });
 
     let mut final_clusters = Vec::new();
-    for (new_id, (_orig_label, indices)) in cluster_results.into_iter().enumerate() {
-        let cluster_features: Vec<ResponseFeatures> =
-            indices.iter().map(|&i| features[i].clone()).collect();
-        let centroid = calculate_centroid(&cluster_features);
-        let representative =
-            find_representative(&cluster_features, &centroid, &scaler, include_timing);
-        let sample_payloads = collect_sample_payloads(&indices, features, 5);
+    let mut cluster_members: Vec<Vec<usize>> = Vec::new(); // parallel to final_clusters
+    let mut outliers: Vec<usize> = Vec::new();
+    for (_status, global_indices) in features_by_status.iter() {
+        // Get all the features for a given status code
+        let group_feats: Vec<&ResponseFeatures> =
+            global_indices.iter().map(|&i| &features[i]).collect();
+        let mut data = features_to_array(&group_feats, include_timing);
 
-        final_clusters.push(Cluster {
-            id: new_id,
-            features: cluster_features,
-            centroid,
-            representative_response: representative,
-            sample_payloads,
-        });
+        let scaler = Scaler::fit(&data);
+        scaler.transform(&mut data);
+
+        let dataset = DatasetBase::from(data);
+
+        let cluster_memberships = Dbscan::params(min_samples)
+            .tolerance(tolerance)
+            .transform(dataset)
+            .expect("DBSCAN clustering failed");
+
+        let mut cluster_map: HashMap<usize, Vec<usize>> = HashMap::new();
+
+        for (i, cluster_id) in cluster_memberships.targets().iter().enumerate() {
+            match cluster_id {
+                None => outliers.push(global_indices[i]),
+                Some(id) => cluster_map.entry(*id).or_default().push(global_indices[i]),
+            }
+        }
+
+        let mut cluster_results: Vec<(usize, Vec<usize>)> = cluster_map.into_iter().collect();
+        cluster_results.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
+
+        for (_orig_label, indices) in cluster_results {
+            let cluster_features: Vec<ResponseFeatures> =
+                indices.iter().map(|&i| features[i].clone()).collect();
+            let centroid = calculate_centroid(&cluster_features);
+            let representative =
+                find_representative(&cluster_features, &centroid, &scaler, include_timing);
+            let sample_payloads = collect_sample_payloads(&indices, features, 5);
+
+            final_clusters.push(Cluster {
+                id: 0, // re-assigned below after global ordering
+                features: cluster_features,
+                centroid,
+                representative_response: representative,
+                sample_payloads,
+            });
+            cluster_members.push(indices);
+        }
     }
+
+    // Order clusters globally, largest first, so Cluster 0 is the dominant one.
+    let mut order: Vec<usize> = (0..final_clusters.len()).collect();
+    order.sort_by(|&a, &b| final_clusters[b].features.len().cmp(&final_clusters[a].features.len()));
+
+    // Global max_clusters cap: demote the smallest clusters to outliers.
+    if order.len() > max_clusters {
+        for &c in order.iter().skip(max_clusters) {
+            outliers.extend(cluster_members[c].iter().copied());
+        }
+        order.truncate(max_clusters);
+    }
+
+    outliers.sort();
+    let noise_count = outliers.len();
+
+    let mut slots: Vec<Option<Cluster>> = final_clusters.into_iter().map(Some).collect();
+    let final_clusters: Vec<Cluster> = order
+        .into_iter()
+        .enumerate()
+        .map(|(new_id, c)| {
+            let mut cluster = slots[c].take().expect("cluster index taken twice");
+            cluster.id = new_id;
+            cluster
+        })
+        .collect();
 
     DbscanResult {
         clusters: final_clusters,
@@ -200,31 +202,21 @@ fn collect_sample_payloads(
         .collect()
 }
 
-/// turn ResponseFeatures into an feature matrix
-fn features_to_array(
-    features: &[ResponseFeatures],
-    include_timing: bool,
-) -> (Array2<f64>, Vec<usize>) {
+/// Dense feature matrix: [length, (ttfb), words, lines]; the TTFB column
+/// is omitted when timing is disabled. Keep in sync with `find_representative`.
+fn features_to_array(features: &[&ResponseFeatures], include_timing: bool) -> Array2<f64> {
     let n_continuous = if include_timing {
         CONTINUOUS_FEATURES
     } else {
         CONTINUOUS_FEATURES_NO_TIMING
     };
-    let n_features = NUM_STATUS_FEATURES + n_continuous;
     let n_samples = features.len();
 
-    let mut data = Array2::zeros((n_samples, n_features));
-    let mut original_indices = Vec::with_capacity(n_samples);
+    let mut data = Array2::zeros((n_samples, n_continuous));
 
     for (i, feature) in features.iter().enumerate() {
-        let hot = status_one_hot_index(feature.status_code);
-        data[[i, hot]] = 1.0;
-
-        let base = NUM_STATUS_FEATURES;
-        data[[i, base + COL_LENGTH]] = feature.response_length as f64;
-        // Continuous columns are laid out densely; the TTFB column is omitted
-        // entirely when timing analysis is disabled.
-        let mut col = base + COL_LENGTH + 1;
+        data[[i, 0]] = feature.response_length as f64;
+        let mut col = 1;
         if include_timing {
             data[[i, col]] = feature.time_to_first_byte_ms as f64;
             col += 1;
@@ -232,10 +224,9 @@ fn features_to_array(
         data[[i, col]] = feature.response_words as f64;
         col += 1;
         data[[i, col]] = feature.response_lines as f64;
-        original_indices.push(i);
     }
 
-    (data, original_indices)
+    data
 }
 
 fn calculate_centroid(features: &[ResponseFeatures]) -> ClusterCentroid {
@@ -291,10 +282,7 @@ fn find_representative(
         return None;
     }
 
-    let hot = status_one_hot_index(centroid.mode_status_code);
-
-    let base = NUM_STATUS_FEATURES;
-    // Must match the dense column layout used by `features_to_array`.
+    // Column layout mirrors `features_to_array`.
     let centroid_vals: Vec<f64> = if include_timing {
         vec![
             centroid.avg_response_length,
@@ -313,10 +301,10 @@ fn find_representative(
     let n = centroid_vals.len();
     let mut scaled_centroid = vec![0.0f64; n];
     for j in 0..n {
-        if scaler.std[base + j] == 0.0 {
+        if scaler.std[j] == 0.0 {
             scaled_centroid[j] = 0.0;
         } else {
-            scaled_centroid[j] = (centroid_vals[j] - scaler.mean[base + j]) / scaler.std[base + j];
+            scaled_centroid[j] = (centroid_vals[j] - scaler.mean[j]) / scaler.std[j];
         }
     }
 
@@ -324,32 +312,27 @@ fn find_representative(
     let mut representative = 0;
 
     for (i, feature) in features.iter().enumerate() {
-        let code_hot = status_one_hot_index(feature.status_code);
-        let status_diff = if code_hot == hot { 0.0f64 } else { 1.0f64 };
-
         let raw: Vec<f64> = if include_timing {
             vec![
                 feature.response_length as f64,
                 feature.time_to_first_byte_ms as f64,
                 feature.response_words as f64,
                 feature.response_lines as f64,
-                feature.content_length_minus_payload as f64,
             ]
         } else {
             vec![
                 feature.response_length as f64,
                 feature.response_words as f64,
                 feature.response_lines as f64,
-                feature.content_length_minus_payload as f64,
             ]
         };
 
-        let mut dist_sq = status_diff.powi(2);
+        let mut dist_sq: f64 = 0.0;
         for j in 0..n {
-            let scaled = if scaler.std[base + j] == 0.0 {
+            let scaled = if scaler.std[j] == 0.0 {
                 0.0
             } else {
-                (raw[j] - scaler.mean[base + j]) / scaler.std[base + j]
+                (raw[j] - scaler.mean[j]) / scaler.std[j]
             };
             dist_sq += (scaled - scaled_centroid[j]).powi(2);
         }
@@ -400,4 +383,100 @@ pub fn analyze_clusters(result: &DbscanResult) -> Vec<String> {
     }
 
     observations
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feat(status: u16, len: usize, ttfb: u64, words: usize, lines: usize, payload: &str) -> ResponseFeatures {
+        ResponseFeatures {
+            status_code: status,
+            content_type: "text/html".into(),
+            response_length: len,
+            time_to_first_byte_ms: ttfb,
+            response_words: words,
+            response_lines: lines,
+            content_length_minus_payload: len as i64 - 10,
+            payload: Some(payload.to_string()),
+        }
+    }
+
+    /// Mixed-status fixture:
+    /// - 6x 200s at (1000, 100ms, 100w, 10l)  -> one cluster
+    /// - 1x 200  at (9000, 100ms, 100w, 10l)   -> outlier (global index 6)
+    /// - 3x 500s at (300, 50ms, 30w, 3l)       -> own cluster
+    fn mixed_features() -> Vec<ResponseFeatures> {
+        let mut v = Vec::new();
+        for i in 0..6 {
+            v.push(feat(200, 1000, 100, 100, 10, &format!("bulk-{}", i)));
+        }
+        v.push(feat(200, 9000, 100, 100, 10, "far"));
+        for i in 0..3 {
+            v.push(feat(500, 300, 50, 30, 3, &format!("err-{}", i)));
+        }
+        v
+    }
+
+    #[test]
+    fn clusters_are_homogeneous_and_indices_are_global() {
+        let features = mixed_features();
+        let result = perform_clustering(&features, 1.0, 3, 6, true);
+
+        // Two clusters: 6x200 and 3x500, largest first
+        assert_eq!(result.clusters.len(), 2);
+        assert_eq!(result.clusters[0].features.len(), 6);
+        assert_eq!(result.clusters[1].features.len(), 3);
+        for c in &result.clusters {
+            let status = c.centroid.mode_status_code;
+            assert!(c.features.iter().all(|f| f.status_code == status),
+                "cluster {} mixes status codes", c.id);
+        }
+        assert_eq!(result.clusters[0].centroid.mode_status_code, 200);
+        assert_eq!(result.clusters[1].centroid.mode_status_code, 500);
+
+        // Outlier is the far 200, addressed by GLOBAL index
+        assert_eq!(result.outliers, vec![6]);
+        assert_eq!(result.noise_count, 1);
+        assert_eq!(features[6].payload.as_deref(), Some("far"));
+
+        // Sample payloads come from the cluster's real members
+        assert!(result.clusters[0]
+            .sample_payloads
+            .iter()
+            .all(|p| p.starts_with("bulk-")));
+        assert!(result.clusters[1]
+            .sample_payloads
+            .iter()
+            .all(|p| p.starts_with("err-")));
+    }
+
+    #[test]
+    fn max_clusters_is_a_global_cap() {
+        let features = mixed_features();
+        let result = perform_clustering(&features, 1.0, 3, 1, true);
+
+        // Only the largest cluster survives; the 500s are demoted to outliers
+        assert_eq!(result.clusters.len(), 1);
+        assert_eq!(result.clusters[0].centroid.mode_status_code, 200);
+        assert_eq!(result.outliers, vec![6, 7, 8, 9]);
+        assert_eq!(result.noise_count, 4);
+    }
+
+    #[test]
+    fn clustering_is_deterministic_across_runs() {
+        let features = mixed_features();
+        let a = perform_clustering(&features, 1.0, 3, 6, true);
+        let b = perform_clustering(&features, 1.0, 3, 6, true);
+        let sig = |r: &DbscanResult| {
+            (
+                r.clusters
+                    .iter()
+                    .map(|c| (c.id, c.centroid.mode_status_code, c.features.len()))
+                    .collect::<Vec<_>>(),
+                r.outliers.clone(),
+            )
+        };
+        assert_eq!(sig(&a), sig(&b));
+    }
 }
