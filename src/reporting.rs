@@ -65,7 +65,8 @@ pub fn print_fuzzing_summary(fuzzing: &FuzzingResult) {
     }
 
     println!();
-    let cluster_observations = clustering::analyze_clusters(&fuzzing.clustering_result);
+    let cluster_observations =
+        clustering::analyze_clusters(&fuzzing.clustering_result, fuzzing.ttfb_baseline_ref);
     for observation in &cluster_observations {
         println!("  {}", observation);
     }

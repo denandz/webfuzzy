@@ -74,6 +74,11 @@ pub struct Args {
     /// Disable timing analysis
     #[arg(long, default_value = "false")]
     pub disable_timing: bool,
+
+    /// TTFB jitter floor in ms: any status family's TTFB jitter below this
+    /// is raised to it, so normal endpoint wobble is absorbed into the bulk.
+    #[arg(long, default_value_t = 50.0)]
+    pub timing_jitter: f64,
 }
 
 impl Args {

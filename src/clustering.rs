@@ -35,7 +35,6 @@ pub struct DbscanResult {
 const CONTINUOUS_FEATURES: usize = 4;
 /// Number of continuous features when timing analysis is disabled (TTFB excluded).
 const CONTINUOUS_FEATURES_NO_TIMING: usize = 3;
-
 /// Feature scaler using StandardScaler (z-score: (value - mean) / std).
 /// Chosen over log1p because DBSCAN's fixed tolerance needs a consistent
 /// scale, and z-score keeps extreme responses far from the bulk so
@@ -77,6 +76,36 @@ impl Scaler {
             }
         }
     }
+
+    /// Override the (mean, std) used for one column.
+    fn set_scale(&mut self, col: usize, mean: f64, std: f64) {
+        self.mean[col] = mean;
+        self.std[col] = std;
+    }
+}
+
+/// (mode status, mean, sigma) of the baseline TTFBs, with sigma floored to
+/// `jitter_floor_ms`. None with fewer than 2 samples.
+pub fn ttfb_baseline_ref(
+    status_codes: &HashMap<u16, usize>,
+    ttfbs: &[u64],
+    jitter_floor_ms: f64,
+) -> Option<(u16, f64, f64)> {
+    let status = *status_codes.iter().max_by_key(|(_, c)| *c)?.0;
+    if ttfbs.len() < 2 {
+        return None;
+    }
+    let mean = ttfbs.iter().map(|t| *t as f64).sum::<f64>() / ttfbs.len() as f64;
+    let variance = ttfbs
+        .iter()
+        .map(|t| {
+            let d = *t as f64 - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / (ttfbs.len() - 1) as f64;
+    let sigma = variance.sqrt();
+    Some((status, mean, sigma.max(jitter_floor_ms)))
 }
 
 pub fn perform_clustering(
@@ -85,6 +114,8 @@ pub fn perform_clustering(
     min_samples: usize,
     max_clusters: usize,
     include_timing: bool,
+    ttfb_ref: Option<(u16, f64, f64)>,
+    jitter_ms: f64,
 ) -> DbscanResult {
     if features.is_empty() {
         return DbscanResult {
@@ -109,13 +140,27 @@ pub fn perform_clustering(
     let mut final_clusters = Vec::new();
     let mut cluster_members: Vec<Vec<usize>> = Vec::new(); // parallel to final_clusters
     let mut outliers: Vec<usize> = Vec::new();
-    for (_status, global_indices) in features_by_status.iter() {
+    for (status, global_indices) in features_by_status.iter() {
         // Get all the features for a given status code
         let group_feats: Vec<&ResponseFeatures> =
             global_indices.iter().map(|&i| &features[i]).collect();
         let mut data = features_to_array(&group_feats, include_timing);
 
-        let scaler = Scaler::fit(&data);
+        let mut scaler = Scaler::fit(&data);
+        if include_timing {
+            // TTFB column: when this family is the baseline's, scale against
+            // the baseline's own jitter so normal endpoint wobble is absorbed
+            // and only real timing anomalies stand out.
+            if let Some((ref_status, ref_mean, ref_sigma)) = ttfb_ref {
+                if ref_status == *status {
+                    scaler.set_scale(1, ref_mean, ref_sigma);
+                }
+            }
+            // Set the scaler's TTFB stddev to the jitter floor so millisecond
+            // wobble isn't flagged as timing outliers. No-ops when the data
+            // is naturally more variable than the floor.
+            scaler.std[1] = scaler.std[1].max(jitter_ms);
+        }
         scaler.transform(&mut data);
 
         let dataset = DatasetBase::from(data);
@@ -347,8 +392,18 @@ fn find_representative(
     Some(representative)
 }
 
-pub fn analyze_clusters(result: &DbscanResult) -> Vec<String> {
+pub fn analyze_clusters(
+    result: &DbscanResult,
+    ttfb_ref: Option<(u16, f64, f64)>,
+) -> Vec<String> {
     let mut observations = Vec::new();
+
+    if let Some((_status, mean, sigma)) = ttfb_ref {
+        observations.push(format!(
+            "TTFB scaled against baseline jitter (mean {:.1} ms, std {:.1} ms).",
+            mean, sigma
+        ));
+    }
 
     if result.clusters.len() == 1 && result.noise_count == 0 {
         observations.push(
@@ -421,7 +476,7 @@ mod tests {
     #[test]
     fn clusters_are_homogeneous_and_indices_are_global() {
         let features = mixed_features();
-        let result = perform_clustering(&features, 1.0, 3, 6, true);
+        let result = perform_clustering(&features, 1.0, 3, 6, true, None, 0.0);
 
         // Two clusters: 6x200 and 3x500, largest first
         assert_eq!(result.clusters.len(), 2);
@@ -454,7 +509,7 @@ mod tests {
     #[test]
     fn max_clusters_is_a_global_cap() {
         let features = mixed_features();
-        let result = perform_clustering(&features, 1.0, 3, 1, true);
+        let result = perform_clustering(&features, 1.0, 3, 1, true, None, 0.0);
 
         // Only the largest cluster survives; the 500s are demoted to outliers
         assert_eq!(result.clusters.len(), 1);
@@ -466,8 +521,8 @@ mod tests {
     #[test]
     fn clustering_is_deterministic_across_runs() {
         let features = mixed_features();
-        let a = perform_clustering(&features, 1.0, 3, 6, true);
-        let b = perform_clustering(&features, 1.0, 3, 6, true);
+        let a = perform_clustering(&features, 1.0, 3, 6, true, None, 0.0);
+        let b = perform_clustering(&features, 1.0, 3, 6, true, None, 0.0);
         let sig = |r: &DbscanResult| {
             (
                 r.clusters
@@ -478,5 +533,85 @@ mod tests {
             )
         };
         assert_eq!(sig(&a), sig(&b));
+    }
+
+    #[test]
+    fn ttfb_baseline_ref_helper() {
+        let mut statuses = HashMap::new();
+        statuses.insert(200, 8);
+        statuses.insert(500, 2);
+        // mode status, mean, ddof=1 stddev above the floor: kept as-is
+        let ref_ = ttfb_baseline_ref(&statuses, &[90, 110, 80, 120, 95, 105], 5.0).unwrap();
+        assert_eq!(ref_.0, 200);
+        assert!((ref_.1 - 100.0).abs() < 1e-9);
+        assert!((ref_.2 - 14.4914).abs() < 1e-3);
+        // near-stable endpoint: sigma floored to the given jitter
+        let ref_ = ttfb_baseline_ref(&statuses, &[100; 10], 50.0).unwrap();
+        assert!((ref_.2 - 50.0).abs() < 1e-9);
+        // too few samples, or no statuses: no reference
+        assert!(ttfb_baseline_ref(&statuses, &[100], 50.0).is_none());
+        assert!(ttfb_baseline_ref(&HashMap::new(), &[100, 101], 50.0).is_none());
+    }
+
+    #[test]
+    fn baseline_scale_flags_anomaly_within_infamily_sigma() {
+        // Bulk at 96..109 ms around a 100 ms baseline (sigma 5 ms), plus a
+        // +50 ms anomaly and a +5 s sleep. In-family scaling would absorb the
+        // +50 ms anomaly into the bulk (its sigma is inflated by the sleep);
+        // the baseline reference must flag it.
+        let mut features = Vec::new();
+        for (i, ttfb) in [96u64, 98, 100, 101, 103, 105, 107, 109].into_iter().enumerate() {
+            features.push(feat(200, 1000, ttfb, 100, 10, &format!("bulk-{}", i)));
+        }
+        features.push(feat(200, 1000, 150, 100, 10, "slow"));
+        features.push(feat(200, 1000, 6000, 100, 10, "sleep"));
+
+        let result = perform_clustering(&features, 1.0, 3, 6, true, Some((200, 100.0, 5.0)), 0.0);
+
+        assert_eq!(result.clusters.len(), 1);
+        assert_eq!(result.clusters[0].features.len(), 8);
+        assert_eq!(result.outliers, vec![8, 9]);
+    }
+
+    #[test]
+    fn other_status_families_keep_their_own_scale() {
+        // The reference is for 200s; 500s must be scaled in-family. If the
+        // reference were (wrongly) applied to them, their 45..54 ms TTFBs
+        // would sit at -110..-92 sigma and all be noise.
+        let mut features = Vec::new();
+        for (i, ttfb) in (45..=54).enumerate() {
+            features.push(feat(500, 300, ttfb as u64, 30, 3, &format!("err-{}", i)));
+        }
+        let result = perform_clustering(&features, 1.0, 3, 6, true, Some((200, 100.0, 0.5)), 50.0);
+
+        assert_eq!(result.clusters.len(), 1);
+        assert_eq!(result.clusters[0].features.len(), 10);
+        assert_eq!(result.noise_count, 0);
+    }
+
+    #[test]
+    fn no_timing_ignores_the_reference() {
+        // With --disable-timing the TTFB column is absent; the reference
+        // must be a no-op and the layout [length, words, lines] holds.
+        let features = mixed_features();
+        let result = perform_clustering(&features, 1.0, 3, 6, false, Some((200, 100.0, 5.0)), 50.0);
+        assert_eq!(result.clusters.len(), 2);
+        assert_eq!(result.outliers, vec![6]);
+    }
+
+    #[test]
+    fn jitter_floor_applies_to_other_families() {
+        // A 500 family split 40/60 ms: in-family sigma (10 ms) breaks it
+        // into two clusters, the 50 ms floor merges it into one.
+        let mut features = Vec::new();
+        for (i, ttfb) in [40u64, 40, 40, 60, 60, 60].into_iter().enumerate() {
+            features.push(feat(500, 300, ttfb, 30, 3, &format!("err-{}", i)));
+        }
+        let no_floor = perform_clustering(&features, 1.0, 3, 6, true, None, 0.0);
+        assert_eq!(no_floor.clusters.len(), 2);
+        let floored = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
+        assert_eq!(floored.clusters.len(), 1);
+        assert_eq!(floored.clusters[0].features.len(), 6);
+        assert_eq!(floored.noise_count, 0);
     }
 }

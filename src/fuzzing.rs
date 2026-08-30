@@ -20,6 +20,10 @@ pub struct FuzzingResult {
     /// Pearson correlation between input payload length and response content length.
     /// `None` when fewer than 2 successful requests are available.
     pub payload_length_correlation: Option<f64>,
+    /// Baseline TTFB reference (status, mean, sigma) used to scale the TTFB
+    /// feature for the baseline's status family; `None` when unavailable.
+    #[serde(default)]
+    pub ttfb_baseline_ref: Option<(u16, f64, f64)>,
 }
 
 pub async fn run_fuzzing(
@@ -270,12 +274,24 @@ pub async fn run_fuzzing(
         println!("[.] Timing analysis disabled - TTFB excluded from clustering");
     }
 
+    let ttfb_ref = (!args.disable_timing)
+        .then(|| {
+            clustering::ttfb_baseline_ref(
+                &baseline.status_codes,
+                &baseline.ttfbs,
+                args.timing_jitter,
+            )
+        })
+        .flatten();
+
     let clustering_result = clustering::perform_clustering(
         &response_features,
         CLUSTER_TOLERANCE,
         CLUSTER_MIN_SAMPLES,
         args.max_clusters,
         !args.disable_timing,
+        ttfb_ref,
+        args.timing_jitter,
     );
 
     for r in &baseline.request_results {
@@ -303,6 +319,7 @@ pub async fn run_fuzzing(
         clustering_result,
         response_features,
         payload_length_correlation,
+        ttfb_baseline_ref: ttfb_ref,
     })
 }
 
@@ -362,6 +379,7 @@ fn create_empty_result() -> FuzzingResult {
         },
         response_features: Vec::new(),
         payload_length_correlation: None,
+        ttfb_baseline_ref: None,
     }
 }
 
