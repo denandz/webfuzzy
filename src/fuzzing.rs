@@ -100,7 +100,7 @@ pub async fn run_fuzzing(
             let result = client
                 .send_request(
                     &url_with_payload,
-                    &args.method,
+                    args.method.as_deref().unwrap(),
                     &headers_with_payload,
                     body_bytes.as_deref(),
                 )
@@ -155,7 +155,7 @@ pub async fn run_fuzzing(
             let permit = semaphore.clone().acquire_owned().await.unwrap();
             let client_clone = client.clone();
             let url = url.clone();
-            let method = args.method.clone();
+            let method = args.method.clone().unwrap();
             let body_template = body_template_bytes.clone();
             let payload_clone = payload.clone();
             let headers_clone = headers.clone();

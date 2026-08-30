@@ -12,13 +12,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let config = Config::new(args);
     let args = &config.args;
+    let method = args.method.as_deref().unwrap();
 
     let url = args.url.clone().ok_or("URL is required")?;
 
     println!("{}", "Webfuzzy - Web Request Fuzzer");
     println!("{}", "=".repeat(40));
     println!("Target: {url}");
-    println!("Method: {}", args.method);
+    println!("Method: {}", method);
     println!("Run ID: {}", config.run_id);
     println!();
 
@@ -34,13 +35,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| webfuzzy::marker::collapse_spans(s.as_bytes(), args.marker.as_bytes()));
     let probe_url = webfuzzy::marker::collapse_spans_str(&url, &args.marker);
     let initial_request = match http_client
-        .send_request(&probe_url, &args.method, &headers, probe_body.as_deref())
+        .send_request(&probe_url, method, &headers, probe_body.as_deref())
         .await
     {
         Ok((request, response)) => {
             println!(
                 "{}",
-                format!("Initial request: {} {}", args.method, probe_url)
+                format!("Initial request: {} {}", method, probe_url)
             );
             println!("Status: {}", response.status_code);
             println!(

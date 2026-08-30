@@ -26,9 +26,10 @@ pub struct Args {
     #[arg(short, long)]
     pub data: Option<String>,
 
-    /// HTTP method (GET, POST, PUT, DELETE, etc.)
-    #[arg(short = 'X', long = "request", default_value = "GET")]
-    pub method: String,
+    /// HTTP method (GET, POST, PUT, DELETE, etc.). Resolved in Config::new:
+    /// POST when --data is given, GET otherwise.
+    #[arg(short = 'X', long = "request")]
+    pub method: Option<String>,
 
     /// Number of baseline requests to send
     #[arg(long, default_value = "10")]
@@ -117,7 +118,13 @@ pub struct Config {
 
 impl Config {
     /// Build a config from parsed CLI args, generating a fresh run id.
-    pub fn new(args: Args) -> Self {
+    /// Resolves the request method: an explicit -X wins, otherwise POST
+    /// when --data is present, GET otherwise.
+    pub fn new(mut args: Args) -> Self {
+        args.method = args
+            .method
+            .take()
+            .or_else(|| Some(if args.data.is_some() { "POST" } else { "GET" }.into()));
         let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
         Self {
             run_id: Self::generate_run_id(),

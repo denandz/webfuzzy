@@ -89,7 +89,7 @@ pub async fn run_baseline(
         let req_body = body.as_deref();
 
         match client
-            .send_request(&url, &args.method, &headers, req_body)
+            .send_request(&url, args.method.as_deref().unwrap(), &headers, req_body)
             .await
         {
             Ok((request, response)) => {
