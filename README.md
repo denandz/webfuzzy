@@ -71,11 +71,12 @@ Here is a quick PNG that simplifies the concept with only two features (two dime
 The above shows a stable 200 response, a 404 response that has variable content lengths (likely reflecting the input payload), and a timing outlier that warrants further investigation.
 
 Current features used for clustering are:
-    - Status Code - applied categorically, clustering is run per-status code since a difference of HTTP/200 and HTTP/201 is a very meaningful difference for an API. Euclidian distance between response data points for HTTP/200 and HTTP/201, for example, shouldn't be clustered together.
-    - Response content length in bytes.
-    - Time-to-first byte timing data.
-    - Response content word count.
-    - Response content line count.
+
+- Status Code - applied categorically, clustering is run per-status code since a difference of HTTP/200 and HTTP/201 is a very meaningful difference for an API. Euclidian distance between response data points for HTTP/200 and HTTP/201, for example, shouldn't be clustered together.
+- Response content length in bytes.
+- Time-to-first byte timing data.
+- Response content word count.
+- Response content line count.
 
 # License
 
