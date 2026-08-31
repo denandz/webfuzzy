@@ -29,12 +29,18 @@ pub struct DbscanResult {
     pub clusters: Vec<Cluster>,
     pub outliers: Vec<usize>,
     pub noise_count: usize,
+    /// Status families where reflection was detected: (status, Pearson r).
+    #[serde(default)]
+    pub reflection: Vec<(u16, f64)>,
 }
 
 /// Number of continuous features - length, ttfb, words, lines
 const CONTINUOUS_FEATURES: usize = 4;
 /// Number of continuous features when timing analysis is disabled (TTFB excluded).
 const CONTINUOUS_FEATURES_NO_TIMING: usize = 3;
+/// Pearson r between payload length and response length required to treat
+/// the payload as reflected in the response.
+const REFLECTION_CORRELATION_THRESHOLD: f64 = 0.8;
 /// Feature scaler using StandardScaler (z-score: (value - mean) / std).
 /// Chosen over log1p because DBSCAN's fixed tolerance needs a consistent
 /// scale, and z-score keeps extreme responses far from the bulk so
@@ -122,6 +128,7 @@ pub fn perform_clustering(
             clusters: Vec::new(),
             outliers: Vec::new(),
             noise_count: 0,
+            reflection: Vec::new(),
         };
     }
 
@@ -140,11 +147,18 @@ pub fn perform_clustering(
     let mut final_clusters = Vec::new();
     let mut cluster_members: Vec<Vec<usize>> = Vec::new(); // parallel to final_clusters
     let mut outliers: Vec<usize> = Vec::new();
+    let mut reflection: Vec<(u16, f64)> = Vec::new();
     for (status, global_indices) in features_by_status.iter() {
         // Get all the features for a given status code
         let group_feats: Vec<&ResponseFeatures> =
             global_indices.iter().map(|&i| &features[i]).collect();
-        let mut data = features_to_array(&group_feats, include_timing);
+        // Reflected payloads make the response length track the payload
+        // length, fragmenting the cluster; regress it out when detected.
+        let regression = reflection_regression(&group_feats);
+        if let Some((r, _slope)) = regression {
+            reflection.push((*status, r));
+        }
+        let mut data = features_to_array(&group_feats, include_timing, regression);
 
         let mut scaler = Scaler::fit(&data);
         if include_timing {
@@ -186,8 +200,13 @@ pub fn perform_clustering(
             let cluster_features: Vec<ResponseFeatures> =
                 indices.iter().map(|&i| features[i].clone()).collect();
             let centroid = calculate_centroid(&cluster_features);
-            let representative =
-                find_representative(&cluster_features, &centroid, &scaler, include_timing);
+            let representative = find_representative(
+                &cluster_features,
+                &centroid,
+                &scaler,
+                include_timing,
+                regression,
+            );
             let sample_payloads = collect_sample_payloads(&indices, features, 5);
 
             final_clusters.push(Cluster {
@@ -231,6 +250,7 @@ pub fn perform_clustering(
         clusters: final_clusters,
         outliers,
         noise_count,
+        reflection,
     }
 }
 
@@ -247,9 +267,53 @@ fn collect_sample_payloads(
         .collect()
 }
 
+/// Byte length of the raw payload; 0 when the request carried none.
+fn payload_len(feature: &ResponseFeatures) -> f64 {
+    feature.payload.as_ref().map(|p| p.len() as f64).unwrap_or(0.0)
+}
+
+/// (Pearson r, slope) of response length regressed on payload length, when
+/// r exceeds the reflection threshold. The slope covers decoders too, where
+/// the reflected length is a fraction of the payload length.
+fn reflection_regression(features: &[&ResponseFeatures]) -> Option<(f64, f64)> {
+    let pairs: Vec<(f64, f64)> = features
+        .iter()
+        .map(|f| (payload_len(f), f.response_length as f64))
+        .collect();
+    let n = pairs.len() as f64;
+    if n < 2.0 {
+        return None;
+    }
+    let mean_x = pairs.iter().map(|&(x, _)| x).sum::<f64>() / n;
+    let mean_y = pairs.iter().map(|&(_, y)| y).sum::<f64>() / n;
+    let var_x = pairs.iter().map(|&(x, _)| (x - mean_x).powi(2)).sum::<f64>() / n;
+    let var_y = pairs.iter().map(|&(_, y)| (y - mean_y).powi(2)).sum::<f64>() / n;
+    if var_x == 0.0 || var_y == 0.0 {
+        return None;
+    }
+    let cov = pairs.iter().map(|&(x, y)| (x - mean_x) * (y - mean_y)).sum::<f64>() / n;
+    let r = cov / (var_x.sqrt() * var_y.sqrt());
+    if r < REFLECTION_CORRELATION_THRESHOLD {
+        return None;
+    }
+    Some((r, cov / var_x))
+}
+
+/// Response length with the reflected payload component removed.
+fn adjusted_length(feature: &ResponseFeatures, regression: Option<(f64, f64)>) -> f64 {
+    match regression {
+        Some((_r, slope)) => feature.response_length as f64 - slope * payload_len(feature),
+        None => feature.response_length as f64,
+    }
+}
+
 /// Dense feature matrix: [length, (ttfb), words, lines]; the TTFB column
 /// is omitted when timing is disabled. Keep in sync with `find_representative`.
-fn features_to_array(features: &[&ResponseFeatures], include_timing: bool) -> Array2<f64> {
+fn features_to_array(
+    features: &[&ResponseFeatures],
+    include_timing: bool,
+    regression: Option<(f64, f64)>,
+) -> Array2<f64> {
     let n_continuous = if include_timing {
         CONTINUOUS_FEATURES
     } else {
@@ -259,16 +323,21 @@ fn features_to_array(features: &[&ResponseFeatures], include_timing: bool) -> Ar
 
     let mut data = Array2::zeros((n_samples, n_continuous));
 
+    // A reflected payload drives the word and line counts too, and the
+    // server's exact mapping is unknown; squash them to zero so they cannot
+    // fragment the family. The fitted sigma of 0 makes their distance
+    // contribution zero in `find_representative` as well.
+    let squash = regression.is_some();
     for (i, feature) in features.iter().enumerate() {
-        data[[i, 0]] = feature.response_length as f64;
+        data[[i, 0]] = adjusted_length(feature, regression);
         let mut col = 1;
         if include_timing {
             data[[i, col]] = feature.time_to_first_byte_ms as f64;
             col += 1;
         }
-        data[[i, col]] = feature.response_words as f64;
+        data[[i, col]] = if squash { 0.0 } else { feature.response_words as f64 };
         col += 1;
-        data[[i, col]] = feature.response_lines as f64;
+        data[[i, col]] = if squash { 0.0 } else { feature.response_lines as f64 };
     }
 
     data
@@ -322,22 +391,34 @@ fn find_representative(
     centroid: &ClusterCentroid,
     scaler: &Scaler,
     include_timing: bool,
+    regression: Option<(f64, f64)>,
 ) -> Option<usize> {
     if features.is_empty() {
         return None;
     }
 
+    // The centroid stores the RAW mean length (for reporting); the distance
+    // math needs the adjusted mean when reflection was regressed out.
+    let centroid_length = match regression {
+        Some((_r, _slope)) => features
+            .iter()
+            .map(|f| adjusted_length(f, regression))
+            .sum::<f64>()
+            / features.len() as f64,
+        None => centroid.avg_response_length,
+    };
+
     // Column layout mirrors `features_to_array`.
     let centroid_vals: Vec<f64> = if include_timing {
         vec![
-            centroid.avg_response_length,
+            centroid_length,
             centroid.avg_ttfb_ms,
             centroid.avg_response_words,
             centroid.avg_response_lines,
         ]
     } else {
         vec![
-            centroid.avg_response_length,
+            centroid_length,
             centroid.avg_response_words,
             centroid.avg_response_lines,
         ]
@@ -359,14 +440,14 @@ fn find_representative(
     for (i, feature) in features.iter().enumerate() {
         let raw: Vec<f64> = if include_timing {
             vec![
-                feature.response_length as f64,
+                adjusted_length(feature, regression),
                 feature.time_to_first_byte_ms as f64,
                 feature.response_words as f64,
                 feature.response_lines as f64,
             ]
         } else {
             vec![
-                feature.response_length as f64,
+                adjusted_length(feature, regression),
                 feature.response_words as f64,
                 feature.response_lines as f64,
             ]
@@ -402,6 +483,13 @@ pub fn analyze_clusters(
         observations.push(format!(
             "TTFB scaled against baseline jitter (mean {:.1} ms, std {:.1} ms).",
             mean, sigma
+        ));
+    }
+
+    for (status, r) in &result.reflection {
+        observations.push(format!(
+            "Reflection detected on status {} (r = {:.2})",
+            status, r
         ));
     }
 

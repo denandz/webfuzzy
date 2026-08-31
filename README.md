@@ -62,7 +62,7 @@ Options:
 
 # Clustering
 
-WebFuzzy uses DBSCAN to cluster response data into groups, with the aim of quickly idenfying how an target API or application behaves.
+WebFuzzy uses DBSCAN to cluster response data into groups, with the aim of quickly identifying how a target API or application behaves.
 
 Here is a quick PNG that simplifies the concept with only two features (two dimensions):
 
@@ -77,6 +77,15 @@ Current features used for clustering are:
 - Time-to-first byte timing data.
 - Response content word count.
 - Response content line count.
+
+These raw values are not directly comparable (bytes vs milliseconds vs counts), so each status family is z-scored against its own mean and standard deviation before DBSCAN runs (think [StandardScaler](https://scikit-learn.org/stable/modules/generated/sklearn.preprocessing.StandardScaler.html)). Two further adjustments keep the length and timing features from producing false outliers:
+
+- TTFB jitter scaling. Timing on a fast network is dominated by millisecond-scale wobble. The family that matches the baseline's mode status is scaled against the baseline's own mean and standard deviation (a control group of un-injected requests), and every family's TTFB standard deviation is floored at `--timing-jitter` (default 50 ms). TLDR: by default we don't really cluster on timing thats less than ~50ms of wobbly.
+- Reflection regression. An endpoint that reflects the input payload (think reflected XSS) makes response length track payload length, which fragments the clusters into one point per payload length. When the Pearson correlation between payload length and response length within a family reaches 0.8, the length feature is replaced by the regression residual (`content_length - slope * payload_length`); the slope covers decoders as well, where the reflected length is a fraction of the payload length. Word and line counts are driven by the reflected payload too, and the server's exact mapping is unknown, so they are squashed to zero for that family.
+
+A deliberate side effect of the reflection handling: payloads whose encoding the server transforms (heavy percent-encoding, charset tricks) decode to a different fraction than the population average and keep a residual, surfacing as small clusters or outliers. This is intentional! These are the payloads worth a human look since they indicate some form of encoding/decoding behaviour that's worth investigating!
+
+The goal is 'weird handling of data, or odd encoding' gets its own cluster or gets flagged as an outlier.
 
 # License
 

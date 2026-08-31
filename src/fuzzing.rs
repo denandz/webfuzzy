@@ -376,6 +376,7 @@ fn create_empty_result() -> FuzzingResult {
             clusters: Vec::new(),
             outliers: Vec::new(),
             noise_count: 0,
+            reflection: Vec::new(),
         },
         response_features: Vec::new(),
         payload_length_correlation: None,
