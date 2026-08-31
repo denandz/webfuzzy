@@ -52,7 +52,19 @@ pub fn print_fuzzing_summary(fuzzing: &FuzzingResult) {
     println!("  Successful: {}", fuzzing.successful_requests);
     println!("  Failed: {}", fuzzing.failed_requests);
     match fuzzing.payload_length_correlation {
-        Some(r) => println!("  Payload-response correlation: {r:.4}"),
+        Some(r) => {
+            if r > 0.8 {
+                println!(
+                    "  Payload-response correlation (HIGH - likely payload reflection): {r:.4}"
+                );
+            } else if r > 0.5 {
+                println!(
+                    "  Payload-response correlation (MED - check for reflection and length-based clusters): {r:.4}"
+                );
+            } else {
+                println!("  Payload-response correlation: {r:.4}");
+            }
+        }
         None => println!("  Payload-response correlation: N/A"),
     }
     println!();
