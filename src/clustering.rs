@@ -505,13 +505,20 @@ pub fn analyze_clusters(
 
         for cluster in &result.clusters {
             observations.push(format!(
-                "Cluster {}: {} responses (status: {:>3}, length: {:>6}, TTFB: {:>4}ms)",
+                "Cluster {}: {} responses (status: {:>3})",
                 cluster.id,
                 cluster.features.len(),
                 cluster.centroid.mode_status_code,
-                cluster.centroid.avg_response_length as usize,
-                cluster.centroid.avg_ttfb_ms as u64,
             ));
+            let lengths: Vec<u64> =
+                cluster.features.iter().map(|f| f.response_length as u64).collect();
+            let ttfbs: Vec<u64> =
+                cluster.features.iter().map(|f| f.time_to_first_byte_ms).collect();
+            observations.push(format!(
+                "    length: {} bytes",
+                describe_range(&lengths)
+            ));
+            observations.push(format!("    ttfb:   {} ms", describe_range(&ttfbs)));
             for payload in &cluster.sample_payloads {
                 observations.push(format!("    Sample payload: '{}'", payload));
             }
@@ -526,6 +533,17 @@ pub fn analyze_clusters(
     }
 
     observations
+}
+
+/// "mean 56, min 33, max 132" for a non-empty column of values.
+fn describe_range(values: &[u64]) -> String {
+    let sum = values.iter().sum::<u64>();
+    format!(
+        "mean {}, min {}, max {}",
+        sum / values.len().max(1) as u64,
+        values.iter().copied().min().unwrap_or(0),
+        values.iter().copied().max().unwrap_or(0),
+    )
 }
 
 #[cfg(test)]
