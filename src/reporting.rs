@@ -62,10 +62,10 @@ pub fn print_fuzzing_summary(fuzzing: &FuzzingResult) {
                     "  Payload-response correlation (MED - check for reflection and length-based clusters): {r:.4}"
                 );
             } else {
-                println!("  Payload-response correlation: {r:.4}");
+                println!("  Payload-response correlation (LOW - reflection unlikely): {r:.4}");
             }
         }
-        None => println!("  Payload-response correlation: N/A"),
+        None => println!("  Payload-response correlation: N/A - No reflection"),
     }
     println!();
     println!("  Status code distribution:");
@@ -93,7 +93,7 @@ pub fn print_fuzzing_summary(fuzzing: &FuzzingResult) {
         for &idx in fuzzing.clustering_result.outliers.iter().take(10) {
             if let Some(feature) = fuzzing.response_features.get(idx) {
                 let payload = feature.payload.as_deref().unwrap_or("");
-                println!("    '{}'", truncate(payload, 70));
+                println!("    '{}'", truncate(payload, 40));
             }
         }
     }
@@ -112,7 +112,7 @@ pub fn print_outlier_details(fuzzing: &FuzzingResult) {
         if let Some(feature) = fuzzing.response_features.get(outlier_idx) {
             println!(
                 "  Sequence {outlier_idx} (payload: '{}')",
-                truncate(&feature.payload.clone().unwrap_or_default(), 40)
+                feature.payload.as_deref().unwrap_or("")
             );
             println!("    Status: {}", feature.status_code);
             println!("    Length: {} bytes", feature.response_length);
