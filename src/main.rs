@@ -21,6 +21,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Target: {url}");
     println!("Method: {}", method);
     println!("Run ID: {}", config.run_id);
+    println!("Threads: {}", config.args.threads);
     println!();
 
     let audit_logger = AuditLogger::new(&args.output, &config.run_id);
