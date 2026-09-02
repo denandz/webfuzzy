@@ -1,0 +1,13 @@
+application/javascript
+application/json
+application/octet-stream
+application/pdf
+application/xml
+application/x-ndjson
+image/jpeg
+image/png
+text/css
+text/csv
+text/html
+text/plain
+text/xml

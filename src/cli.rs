@@ -77,6 +77,7 @@ pub struct Args {
 
     /// TTFB jitter floor in ms: any status family's TTFB jitter below this
     /// is raised to it, so normal endpoint wobble is absorbed into the bulk.
+    /// TLDR: we don't really care about ~50ms of wobble by default
     #[arg(long, default_value_t = 50.0)]
     pub timing_jitter: f64,
 }
