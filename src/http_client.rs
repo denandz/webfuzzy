@@ -192,7 +192,7 @@ impl HttpClient {
                     let fallback = String::from_utf8_lossy(value.as_bytes()).to_string();
                     if self.args.verbose {
                         eprintln!(
-                            "  [WARN] header {} fallback (invalid bytes): \"{}\" -> \"{}\"",
+                            "  [!] header {} fallback (invalid bytes): \"{}\" -> \"{}\"",
                             name,
                             String::from_utf8_lossy(value.as_bytes()),
                             fallback,

@@ -58,7 +58,7 @@ Options:
 
 - DBSCAN clustering of response data to classify endpoint behaviour quickly, and find outliers (noise). - Curl argument interop. Arguments are as-close-as-possible to `curl`, so any tool that offers a `copy as curl` function (browsers, testing tools) can easily be pasted into a webfuzzy run
 - Sensible defaults, aiming for minimal runtime configuration.
-- Auditability. All HTTP requests and responses sent/recieved by webfuzzy are written to a `jsonl` file in the current directory by default. If the user needs to investigate some condition such as a server crash, this log contains all data sent/recieved by the `http_client.rs` HTTP client.
+- Auditability. All HTTP requests and responses sent/recieved by webfuzzy are written to a `jsonl` file in the current directory by default. If the user needs to investigate some condition such as a server crash, this log contains all data sent/recieved by the `http_client.rs` HTTP client. When the log exceeds 1MB it is automatically xz-compressed since full-payload logs get large fast.
 
 # Clustering
 

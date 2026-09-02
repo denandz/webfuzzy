@@ -67,6 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // initial request failed, no point continuing
     if initial_request.is_none() {
+        audit_logger.close();
         return Ok(());
     }
 
@@ -89,5 +90,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     reporting::print_fuzzing_summary(&fuzz_result);
     reporting::print_outlier_details(&fuzz_result);
 
-    return Ok(());
+    audit_logger.close();
+    Ok(())
 }

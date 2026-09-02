@@ -1,6 +1,6 @@
 use std::fs::File;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use chrono::Utc;
@@ -8,6 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::baseline::BaselineResult;
 use crate::http_client::{HttpRequest, HttpResponse, RequestResult};
+
+/// Real-time jsonl logs bigger than this (1MB) are xz-compressed on close.
+const XZ_THRESHOLD: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuditLog {
@@ -71,11 +74,19 @@ impl AuditLogger {
 
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
         let log_path = output_dir.join(format!("audit_{}_{id}.jsonl", timestamp));
-        let log_file = match File::create(&log_path) {
+        // Opened read+write: close() re-reads the file to xz-compress it
+        // when it exceeds 1MB.
+        let log_file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&log_path)
+        {
             Ok(f) => Some(f),
             Err(e) => {
                 eprintln!(
-                    "  [WARN] could not create audit log '{}': {} - raw request data will NOT be recorded",
+                    "[!] could not create audit log '{}': {} - raw request data will NOT be recorded",
                     log_path.display(),
                     e
                 );
@@ -112,7 +123,7 @@ impl AuditLogger {
             });
 
             if let Err(e) = writeln!(file, "{}", entry) {
-                eprintln!("  [WARN] failed to write audit log entry: {}", e);
+                eprintln!("[!] failed to write audit log entry: {}", e);
             }
         }
     }
@@ -129,7 +140,7 @@ impl AuditLogger {
             });
 
             if let Err(e) = writeln!(file, "{}", entry) {
-                eprintln!("  [WARN] failed to write audit log entry: {}", e);
+                eprintln!("[!] failed to write audit log entry: {}", e);
             }
         }
     }
@@ -147,7 +158,7 @@ impl AuditLogger {
             });
 
             if let Err(e) = writeln!(file, "{}", entry) {
-                eprintln!("  [WARN] failed to write audit log entry: {}", e);
+                eprintln!("  [!] failed to write audit log entry: {}", e);
             }
         }
     }
@@ -155,6 +166,44 @@ impl AuditLogger {
     /// Path of the real-time jsonl request log for this run.
     pub fn jsonl_path(&self) -> PathBuf {
         self.inner.lock().unwrap().log_path.clone()
+    }
+
+    /// Close the real-time log. XZ-compressed if it's larger than 1MB
+    /// and the original is removed. `jsonl_path` ends up pointing at the
+    /// `.xz` file.
+    pub fn close(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let Some(file) = inner.log_file.take() else {
+            return;
+        };
+        let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        if len <= XZ_THRESHOLD {
+            return;
+        }
+
+        let xz_path = inner.log_path.with_extension("jsonl.xz");
+        match compress_xz(file, &xz_path) {
+            Ok(()) => {
+                if let Err(e) = std::fs::remove_file(&inner.log_path) {
+                    eprintln!(
+                        "[!] compressed audit log but could not remove '{}': {} (both files kept)",
+                        inner.log_path.display(),
+                        e
+                    );
+                }
+                eprintln!(
+                    "[*] audit log was {} bytes (>1MB), saved as '{}'",
+                    len,
+                    xz_path.display()
+                );
+                inner.log_path = xz_path;
+            }
+            Err(e) => eprintln!(
+                "[!] failed to compress audit log '{}': {} - keeping the uncompressed file",
+                inner.log_path.display(),
+                e
+            ),
+        }
     }
 
     /// Write the single end-of-run result file: scan metadata (including the
@@ -188,6 +237,15 @@ impl AuditLogger {
 
         Ok(output_path)
     }
-
 }
 
+/// Stream `file` through xz (preset 6) into `xz_path`.
+fn compress_xz(file: File, xz_path: &Path) -> std::io::Result<()> {
+    // The log fd's offset sits at the end after the writes; restart at 0.
+    let mut file = file;
+    file.seek(SeekFrom::Start(0))?;
+    let mut encoder = xz2::read::XzEncoder::new(file, 6);
+    let mut out = File::create(xz_path)?;
+    std::io::copy(&mut encoder, &mut out)?;
+    out.sync_all()
+}
