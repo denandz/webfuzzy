@@ -38,6 +38,19 @@ pub struct DbscanResult {
 const CONTINUOUS_FEATURES: usize = 4;
 /// Number of continuous features when timing analysis is disabled (TTFB excluded).
 const CONTINUOUS_FEATURES_NO_TIMING: usize = 3;
+/// Response content types that get their own one-hot column, one type per
+/// line in wordlists/content_types.txt.
+static KNOWN_CONTENT_TYPES: &str = include_str!("../wordlists/content_types.txt");
+/// One-hot column count: one per non-empty line of the embedded list, plus
+/// the no-header and unknown columns.
+fn content_type_columns() -> usize {
+    KNOWN_CONTENT_TYPES
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
+        + 2
+}
+
 /// Pearson r between payload length and response length required to treat
 /// the payload as reflected in the response.
 const REFLECTION_CORRELATION_THRESHOLD: f64 = 0.8;
@@ -307,18 +320,46 @@ fn adjusted_length(feature: &ResponseFeatures, regression: Option<(f64, f64)>) -
     }
 }
 
-/// Dense feature matrix: [length, (ttfb), words, lines]; the TTFB column
-/// is omitted when timing is disabled. Keep in sync with `find_representative`.
+/// Bare media type for column lookup: "; ..." parameters stripped, case
+/// kept.
+fn bare_media_type(content_type: &str) -> String {
+    content_type.split(';').next().unwrap_or("").trim().to_string()
+}
+
+/// One-hot column index for a content type: known types first, then the
+/// no-header and unknown columns.
+fn content_type_column(content_type: &str) -> usize {
+    let ct = bare_media_type(content_type);
+    let mut known = 0usize;
+    for line in KNOWN_CONTENT_TYPES.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.trim() == ct.as_str() {
+            return known;
+        }
+        known += 1;
+    }
+    if ct.is_empty() {
+        known
+    } else {
+        known + 1
+    }
+}
+
+/// Dense feature matrix: [length, (ttfb), words, lines, one-hot content
+/// type columns]; the TTFB column is omitted when timing is disabled. Keep
+/// in sync with `find_representative`.
 fn features_to_array(
     features: &[&ResponseFeatures],
     include_timing: bool,
     regression: Option<(f64, f64)>,
 ) -> Array2<f64> {
-    let n_continuous = if include_timing {
+    let n_continuous = (if include_timing {
         CONTINUOUS_FEATURES
     } else {
         CONTINUOUS_FEATURES_NO_TIMING
-    };
+    }) + content_type_columns();
     let n_samples = features.len();
 
     let mut data = Array2::zeros((n_samples, n_continuous));
@@ -338,6 +379,8 @@ fn features_to_array(
         data[[i, col]] = if squash { 0.0 } else { feature.response_words as f64 };
         col += 1;
         data[[i, col]] = if squash { 0.0 } else { feature.response_lines as f64 };
+        col += 1;
+        data[[i, col + content_type_column(&feature.content_type)]] = 1.0;
     }
 
     data
@@ -409,7 +452,7 @@ fn find_representative(
     };
 
     // Column layout mirrors `features_to_array`.
-    let centroid_vals: Vec<f64> = if include_timing {
+    let mut centroid_vals: Vec<f64> = if include_timing {
         vec![
             centroid_length,
             centroid.avg_ttfb_ms,
@@ -423,6 +466,22 @@ fn find_representative(
             centroid.avg_response_lines,
         ]
     };
+
+    // One-hot content-type columns, same layout as `features_to_array`.
+    // The centroid takes the cluster's mode type; clusters are effectively
+    // single-type, so this is a formality.
+    let mut ct_counts: HashMap<String, usize> = HashMap::new();
+    for f in features {
+        *ct_counts.entry(f.content_type.clone()).or_default() += 1;
+    }
+    let mode_ct = ct_counts
+        .iter()
+        .max_by(|a, b| a.1.cmp(b.1).then_with(|| a.0.cmp(b.0)))
+        .map(|(ct, _)| ct.clone())
+        .unwrap_or_default();
+    centroid_vals.extend(std::iter::repeat(0.0).take(content_type_columns()));
+    let ct_index = centroid_vals.len() - content_type_columns() + content_type_column(&mode_ct);
+    centroid_vals[ct_index] = 1.0;
 
     let n = centroid_vals.len();
     let mut scaled_centroid = vec![0.0f64; n];
@@ -438,7 +497,7 @@ fn find_representative(
     let mut representative = 0;
 
     for (i, feature) in features.iter().enumerate() {
-        let raw: Vec<f64> = if include_timing {
+        let mut raw: Vec<f64> = if include_timing {
             vec![
                 adjusted_length(feature, regression),
                 feature.time_to_first_byte_ms as f64,
@@ -452,6 +511,9 @@ fn find_representative(
                 feature.response_lines as f64,
             ]
         };
+        raw.extend(std::iter::repeat(0.0).take(content_type_columns()));
+        let ct_index = raw.len() - content_type_columns() + content_type_column(&feature.content_type);
+        raw[ct_index] = 1.0;
 
         let mut dist_sq: f64 = 0.0;
         for j in 0..n {
@@ -561,6 +623,20 @@ mod tests {
             content_length_minus_payload: len as i64 - 10,
             payload: Some(payload.to_string()),
         }
+    }
+
+    fn feat_ct(
+        status: u16,
+        len: usize,
+        ttfb: u64,
+        words: usize,
+        lines: usize,
+        payload: &str,
+        ct: &str,
+    ) -> ResponseFeatures {
+        let mut f = feat(status, len, ttfb, words, lines, payload);
+        f.content_type = ct.to_string();
+        f
     }
 
     /// Mixed-status fixture:
@@ -719,5 +795,86 @@ mod tests {
         assert_eq!(floored.clusters.len(), 1);
         assert_eq!(floored.clusters[0].features.len(), 6);
         assert_eq!(floored.noise_count, 0);
+    }
+
+    #[test]
+    fn content_type_split_forms_two_clusters() {
+        // Identical responses except content type: html vs json must split.
+        let mut features = Vec::new();
+        for i in 0..6 {
+            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("html-{}", i), "text/html"));
+            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("json-{}", i), "application/json"));
+        }
+        let result = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
+
+        assert_eq!(result.clusters.len(), 2);
+        assert_eq!(result.noise_count, 0);
+        let sizes: Vec<usize> = result.clusters.iter().map(|c| c.features.len()).collect();
+        assert_eq!(sizes, vec![6, 6]);
+    }
+
+    #[test]
+    fn rare_content_type_is_an_outlier() {
+        // One json response in a sea of html: too few to form a cluster,
+        // must be flagged as noise.
+        let mut features = Vec::new();
+        for i in 0..8 {
+            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("html-{}", i), "text/html"));
+        }
+        features.push(feat_ct(200, 1000, 100, 50, 5, "json", "application/json"));
+        let result = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
+
+        assert_eq!(result.clusters.len(), 1);
+        assert_eq!(result.clusters[0].features.len(), 8);
+        assert_eq!(result.outliers, vec![8]);
+    }
+
+    #[test]
+    fn content_type_matching_strips_parameters() {
+        // "text/html; charset=UTF-8" lands in the text/html column.
+        let mut features = Vec::new();
+        for i in 0..6 {
+            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("a-{}", i), "text/html; charset=UTF-8"));
+            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("b-{}", i), "text/html"));
+        }
+        let result = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
+
+        assert_eq!(result.clusters.len(), 1);
+        assert_eq!(result.clusters[0].features.len(), 12);
+        assert_eq!(result.noise_count, 0);
+    }
+
+    #[test]
+    fn non_canonical_case_content_type_is_unknown() {
+        // "Text/HTML" deliberately misses the canonical column; the six
+        // variants form their own cluster via the unknown column and the
+        // json response is the outlier.
+        let mut features = Vec::new();
+        for i in 0..6 {
+            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("weird-{}", i), "Text/HTML; charset=UTF-8"));
+            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("html-{}", i), "text/html"));
+        }
+        features.push(feat_ct(200, 1000, 100, 50, 5, "json", "application/json"));
+        let result = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
+
+        assert_eq!(result.clusters.len(), 2);
+        let sizes: Vec<usize> = result.clusters.iter().map(|c| c.features.len()).collect();
+        assert_eq!(sizes, vec![6, 6]);
+        assert_eq!(result.outliers, vec![12]);
+    }
+
+    #[test]
+    fn no_header_and_unknown_content_types_separate() {
+        // html, missing header, and an unknown type: three groups.
+        let mut features = Vec::new();
+        for i in 0..5 {
+            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("html-{}", i), "text/html"));
+            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("none-{}", i), ""));
+            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("gif-{}", i), "image/gif"));
+        }
+        let result = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
+
+        assert_eq!(result.clusters.len(), 3);
+        assert_eq!(result.noise_count, 0);
     }
 }
