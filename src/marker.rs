@@ -104,16 +104,10 @@ pub fn inject_headers(
 
 /// Collapse every marker span in each header key and value to its inner
 /// content (baseline: send the original value, no markers).
-pub fn collapse_headers(
-    headers: &[(String, String)],
-    marker: &[u8],
-) -> Vec<(String, String)> {
+pub fn collapse_headers(headers: &[(String, String)], marker: &[u8]) -> Vec<(String, String)> {
     headers
         .iter()
-        .map(|(k, v)| (
-            collapse_part(k, marker),
-            collapse_part(v, marker),
-        ))
+        .map(|(k, v)| (collapse_part(k, marker), collapse_part(v, marker)))
         .collect()
 }
 
@@ -149,8 +143,7 @@ fn find_byte_seq(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     if needle.is_empty() || haystack.len() < needle.len() {
         return None;
     }
-    (0..=haystack.len() - needle.len())
-        .find(|&i| &haystack[i..i + needle.len()] == needle)
+    (0..=haystack.len() - needle.len()).find(|&i| &haystack[i..i + needle.len()] == needle)
 }
 
 #[cfg(test)]

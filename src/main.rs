@@ -1,9 +1,9 @@
 use clap::Parser;
 use webfuzzy::baseline;
 use webfuzzy::cli::{Args, Config};
+use webfuzzy::fuzzing;
 use webfuzzy::http_client::HttpClient;
 use webfuzzy::logging::AuditLogger;
-use webfuzzy::fuzzing;
 use webfuzzy::reporting;
 
 #[tokio::main]
@@ -28,8 +28,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_client = HttpClient::new(args, audit_logger.clone())?;
 
     // Probe with the original request (marker spans collapsed), like the baseline.
-    let headers =
-        webfuzzy::marker::collapse_headers(&args.parse_headers(), args.marker.as_bytes());
+    let headers = webfuzzy::marker::collapse_headers(&args.parse_headers(), args.marker.as_bytes());
     let probe_body: Option<Vec<u8>> = args
         .data
         .as_ref()
@@ -40,10 +39,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await
     {
         Ok((request, response)) => {
-            println!(
-                "{}",
-                format!("Initial request: {} {}", method, probe_url)
-            );
+            println!("{}", format!("Initial request: {} {}", method, probe_url));
             println!("Status: {}", response.status_code);
             println!(
                 "Content-Type: {}",

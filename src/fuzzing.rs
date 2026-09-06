@@ -5,9 +5,9 @@ use tokio::sync::Semaphore;
 
 use crate::baseline::BaselineResult;
 use crate::cli::Args;
-use crate::marker;
 use crate::clustering::{self, DbscanResult};
 use crate::http_client::{HttpClient, RequestResult, ResponseFeatures};
+use crate::marker;
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FuzzingResult {
@@ -93,13 +93,11 @@ pub async fn run_fuzzing(
     if args.threads <= 1 {
         for (i, payload) in wordlist.iter().enumerate() {
             let payload_display = String::from_utf8_lossy(payload).to_string();
-            let url_with_payload =
-                marker::inject_span_str(&url, &args.marker, &payload_display);
+            let url_with_payload = marker::inject_span_str(&url, &args.marker, &payload_display);
             let body_bytes = body_template_bytes
                 .as_ref()
                 .map(|template| marker::inject_span(template, &marker_bytes, payload));
-            let headers_with_payload =
-                marker::inject_headers(&headers, &marker_bytes, payload);
+            let headers_with_payload = marker::inject_headers(&headers, &marker_bytes, payload);
 
             let result = client
                 .send_request(
@@ -169,8 +167,7 @@ pub async fn run_fuzzing(
 
             let handle = tokio::spawn(async move {
                 let payload_display = String::from_utf8_lossy(&payload_clone).to_string();
-                let url_with_payload =
-                    marker::inject_span_str(&url, &marker_str, &payload_display);
+                let url_with_payload = marker::inject_span_str(&url, &marker_str, &payload_display);
                 let body_bytes = body_template
                     .as_ref()
                     .map(|template| marker::inject_span(template, &marker, &payload_clone));

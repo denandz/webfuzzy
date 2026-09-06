@@ -106,7 +106,7 @@ impl AuditLogger {
     }
 
     /// Add a requstresult object to the logger
-    pub fn add_requestresult(&self, result: &RequestResult){
+    pub fn add_requestresult(&self, result: &RequestResult) {
         let mut inner = self.inner.lock().unwrap();
         inner.requests.push(result.clone());
     }
@@ -219,7 +219,7 @@ impl AuditLogger {
 
         let summary = ScanSummary {
             total_requests: inner.requests.len(),
-            baseline_stable: baseline.stable
+            baseline_stable: baseline.stable,
         };
 
         let audit_log = AuditLog {
@@ -230,8 +230,9 @@ impl AuditLogger {
         };
 
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
-        let output_path =
-            inner.output_dir.join(format!("audit_{}_{}.json", timestamp, inner.file_id));
+        let output_path = inner
+            .output_dir
+            .join(format!("audit_{}_{}.json", timestamp, inner.file_id));
         let json = serde_json::to_string_pretty(&audit_log)?;
         std::fs::write(&output_path, json)?;
 

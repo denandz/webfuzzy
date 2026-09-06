@@ -62,12 +62,10 @@ pub async fn run_baseline(
                 .and_then(|d| marker::first_span_value(d.as_bytes(), &marker_bytes))
         })
         .or_else(|| {
-            headers
-                .iter()
-                .find_map(|(k, v)| {
-                    marker::first_span_value(k.as_bytes(), &marker_bytes)
-                        .or_else(|| marker::first_span_value(v.as_bytes(), &marker_bytes))
-                })
+            headers.iter().find_map(|(k, v)| {
+                marker::first_span_value(k.as_bytes(), &marker_bytes)
+                    .or_else(|| marker::first_span_value(v.as_bytes(), &marker_bytes))
+            })
         })
         .map(|span| span.len())
         .unwrap_or(0);
