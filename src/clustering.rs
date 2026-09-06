@@ -149,13 +149,14 @@ pub fn perform_clustering(
     // response length must not influence the distance between 200s.
     // Groups hold global feature indices and BTree map means deterministic
     // status order.
-    let features_by_status: BTreeMap<u16, Vec<usize>> = features
-        .iter()
-        .enumerate()
-        .fold(BTreeMap::new(), |mut acc, (i, f)| {
-            acc.entry(f.status_code).or_default().push(i);
-            acc
-        });
+    let features_by_status: BTreeMap<u16, Vec<usize>> =
+        features
+            .iter()
+            .enumerate()
+            .fold(BTreeMap::new(), |mut acc, (i, f)| {
+                acc.entry(f.status_code).or_default().push(i);
+                acc
+            });
 
     let mut final_clusters = Vec::new();
     let mut cluster_members: Vec<Vec<usize>> = Vec::new(); // parallel to final_clusters
@@ -235,7 +236,12 @@ pub fn perform_clustering(
 
     // Order clusters globally, largest first, so Cluster 0 is the dominant one.
     let mut order: Vec<usize> = (0..final_clusters.len()).collect();
-    order.sort_by(|&a, &b| final_clusters[b].features.len().cmp(&final_clusters[a].features.len()));
+    order.sort_by(|&a, &b| {
+        final_clusters[b]
+            .features
+            .len()
+            .cmp(&final_clusters[a].features.len())
+    });
 
     // Global max_clusters cap: demote the smallest clusters to outliers.
     if order.len() > max_clusters {
@@ -282,7 +288,11 @@ fn collect_sample_payloads(
 
 /// Byte length of the raw payload; 0 when the request carried none.
 fn payload_len(feature: &ResponseFeatures) -> f64 {
-    feature.payload.as_ref().map(|p| p.len() as f64).unwrap_or(0.0)
+    feature
+        .payload
+        .as_ref()
+        .map(|p| p.len() as f64)
+        .unwrap_or(0.0)
 }
 
 /// (Pearson r, slope) of response length regressed on payload length, when
@@ -299,12 +309,24 @@ fn reflection_regression(features: &[&ResponseFeatures]) -> Option<(f64, f64)> {
     }
     let mean_x = pairs.iter().map(|&(x, _)| x).sum::<f64>() / n;
     let mean_y = pairs.iter().map(|&(_, y)| y).sum::<f64>() / n;
-    let var_x = pairs.iter().map(|&(x, _)| (x - mean_x).powi(2)).sum::<f64>() / n;
-    let var_y = pairs.iter().map(|&(_, y)| (y - mean_y).powi(2)).sum::<f64>() / n;
+    let var_x = pairs
+        .iter()
+        .map(|&(x, _)| (x - mean_x).powi(2))
+        .sum::<f64>()
+        / n;
+    let var_y = pairs
+        .iter()
+        .map(|&(_, y)| (y - mean_y).powi(2))
+        .sum::<f64>()
+        / n;
     if var_x == 0.0 || var_y == 0.0 {
         return None;
     }
-    let cov = pairs.iter().map(|&(x, y)| (x - mean_x) * (y - mean_y)).sum::<f64>() / n;
+    let cov = pairs
+        .iter()
+        .map(|&(x, y)| (x - mean_x) * (y - mean_y))
+        .sum::<f64>()
+        / n;
     let r = cov / (var_x.sqrt() * var_y.sqrt());
     if r < REFLECTION_CORRELATION_THRESHOLD {
         return None;
@@ -323,7 +345,12 @@ fn adjusted_length(feature: &ResponseFeatures, regression: Option<(f64, f64)>) -
 /// Bare media type for column lookup: "; ..." parameters stripped, case
 /// kept.
 fn bare_media_type(content_type: &str) -> String {
-    content_type.split(';').next().unwrap_or("").trim().to_string()
+    content_type
+        .split(';')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_string()
 }
 
 /// One-hot column index for a content type: known types first, then the
@@ -340,11 +367,7 @@ fn content_type_column(content_type: &str) -> usize {
         }
         known += 1;
     }
-    if ct.is_empty() {
-        known
-    } else {
-        known + 1
-    }
+    if ct.is_empty() { known } else { known + 1 }
 }
 
 /// Dense feature matrix: [length, (ttfb), words, lines, one-hot content
@@ -376,9 +399,17 @@ fn features_to_array(
             data[[i, col]] = feature.time_to_first_byte_ms as f64;
             col += 1;
         }
-        data[[i, col]] = if squash { 0.0 } else { feature.response_words as f64 };
+        data[[i, col]] = if squash {
+            0.0
+        } else {
+            feature.response_words as f64
+        };
         col += 1;
-        data[[i, col]] = if squash { 0.0 } else { feature.response_lines as f64 };
+        data[[i, col]] = if squash {
+            0.0
+        } else {
+            feature.response_lines as f64
+        };
         col += 1;
         data[[i, col + content_type_column(&feature.content_type)]] = 1.0;
     }
@@ -443,11 +474,13 @@ fn find_representative(
     // The centroid stores the RAW mean length (for reporting); the distance
     // math needs the adjusted mean when reflection was regressed out.
     let centroid_length = match regression {
-        Some((_r, _slope)) => features
-            .iter()
-            .map(|f| adjusted_length(f, regression))
-            .sum::<f64>()
-            / features.len() as f64,
+        Some((_r, _slope)) => {
+            features
+                .iter()
+                .map(|f| adjusted_length(f, regression))
+                .sum::<f64>()
+                / features.len() as f64
+        }
         None => centroid.avg_response_length,
     };
 
@@ -512,7 +545,8 @@ fn find_representative(
             ]
         };
         raw.extend(std::iter::repeat(0.0).take(content_type_columns()));
-        let ct_index = raw.len() - content_type_columns() + content_type_column(&feature.content_type);
+        let ct_index =
+            raw.len() - content_type_columns() + content_type_column(&feature.content_type);
         raw[ct_index] = 1.0;
 
         let mut dist_sq: f64 = 0.0;
@@ -535,10 +569,7 @@ fn find_representative(
     Some(representative)
 }
 
-pub fn analyze_clusters(
-    result: &DbscanResult,
-    ttfb_ref: Option<(u16, f64, f64)>,
-) -> Vec<String> {
+pub fn analyze_clusters(result: &DbscanResult, ttfb_ref: Option<(u16, f64, f64)>) -> Vec<String> {
     let mut observations = Vec::new();
 
     if let Some((_status, mean, sigma)) = ttfb_ref {
@@ -557,33 +588,55 @@ pub fn analyze_clusters(
 
     if result.clusters.len() == 1 && result.noise_count == 0 {
         observations.push(
-            "All responses belong to a single cluster - responses are consistent.".to_string(),
+            "[.] All responses belong to a single cluster - Responses are consistent.".to_string(),
         );
-    } else {
+    }
+    observations.push(format!(
+        "Found {} distinct response clusters.",
+        result.clusters.len()
+    ));
+
+    for cluster in &result.clusters {
         observations.push(format!(
-            "Found {} distinct response clusters.",
-            result.clusters.len()
+            "Cluster {}: {} responses (status: {:>3})",
+            cluster.id,
+            cluster.features.len(),
+            cluster.centroid.mode_status_code,
         ));
 
-        for cluster in &result.clusters {
-            observations.push(format!(
-                "Cluster {}: {} responses (status: {:>3})",
-                cluster.id,
-                cluster.features.len(),
-                cluster.centroid.mode_status_code,
-            ));
-            let lengths: Vec<u64> =
-                cluster.features.iter().map(|f| f.response_length as u64).collect();
-            let ttfbs: Vec<u64> =
-                cluster.features.iter().map(|f| f.time_to_first_byte_ms).collect();
-            observations.push(format!(
-                "    length: {} bytes",
-                describe_range(&lengths)
-            ));
-            observations.push(format!("    ttfb:   {} ms", describe_range(&ttfbs)));
-            for payload in &cluster.sample_payloads {
-                observations.push(format!("    Sample payload: '{}'", payload));
-            }
+        let mut content_types: HashMap<String, u64> = HashMap::new();
+        cluster
+            .features
+            .iter()
+            .for_each(|f| *content_types.entry(f.content_type.clone()).or_insert(0) += 1);
+
+        let mut content_types_v: Vec<(String, u64)> = content_types.into_iter().collect();
+        content_types_v.sort_by(|a, b| b.1.cmp(&a.1));
+        let top_content_types_str: String = content_types_v
+            .iter().take(5)
+            .map(|(k, v)| format!("{}: {}", k, v))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        observations.push(format!("    Unique Content-Types: {}", content_types_v.len()));
+        observations.push(format!("     {}", top_content_types_str));
+
+        let lengths: Vec<u64> = cluster
+            .features
+            .iter()
+            .map(|f| f.response_length as u64)
+            .collect();
+        let ttfbs: Vec<u64> = cluster
+            .features
+            .iter()
+            .map(|f| f.time_to_first_byte_ms)
+            .collect();
+
+        observations.push(format!("    Length: {} bytes", describe_range(&lengths)));
+        observations.push(format!("    TTFB:   {} ms", describe_range(&ttfbs)));
+
+        for payload in &cluster.sample_payloads {
+            observations.push(format!("    Sample payload: '{}'", payload));
         }
     }
 
@@ -612,7 +665,14 @@ fn describe_range(values: &[u64]) -> String {
 mod tests {
     use super::*;
 
-    fn feat(status: u16, len: usize, ttfb: u64, words: usize, lines: usize, payload: &str) -> ResponseFeatures {
+    fn feat(
+        status: u16,
+        len: usize,
+        ttfb: u64,
+        words: usize,
+        lines: usize,
+        payload: &str,
+    ) -> ResponseFeatures {
         ResponseFeatures {
             status_code: status,
             content_type: "text/html".into(),
@@ -666,8 +726,11 @@ mod tests {
         assert_eq!(result.clusters[1].features.len(), 3);
         for c in &result.clusters {
             let status = c.centroid.mode_status_code;
-            assert!(c.features.iter().all(|f| f.status_code == status),
-                "cluster {} mixes status codes", c.id);
+            assert!(
+                c.features.iter().all(|f| f.status_code == status),
+                "cluster {} mixes status codes",
+                c.id
+            );
         }
         assert_eq!(result.clusters[0].centroid.mode_status_code, 200);
         assert_eq!(result.clusters[1].centroid.mode_status_code, 500);
@@ -678,14 +741,18 @@ mod tests {
         assert_eq!(features[6].payload.as_deref(), Some("far"));
 
         // Sample payloads come from the cluster's real members
-        assert!(result.clusters[0]
-            .sample_payloads
-            .iter()
-            .all(|p| p.starts_with("bulk-")));
-        assert!(result.clusters[1]
-            .sample_payloads
-            .iter()
-            .all(|p| p.starts_with("err-")));
+        assert!(
+            result.clusters[0]
+                .sample_payloads
+                .iter()
+                .all(|p| p.starts_with("bulk-"))
+        );
+        assert!(
+            result.clusters[1]
+                .sample_payloads
+                .iter()
+                .all(|p| p.starts_with("err-"))
+        );
     }
 
     #[test]
@@ -742,7 +809,10 @@ mod tests {
         // +50 ms anomaly into the bulk (its sigma is inflated by the sleep);
         // the baseline reference must flag it.
         let mut features = Vec::new();
-        for (i, ttfb) in [96u64, 98, 100, 101, 103, 105, 107, 109].into_iter().enumerate() {
+        for (i, ttfb) in [96u64, 98, 100, 101, 103, 105, 107, 109]
+            .into_iter()
+            .enumerate()
+        {
             features.push(feat(200, 1000, ttfb, 100, 10, &format!("bulk-{}", i)));
         }
         features.push(feat(200, 1000, 150, 100, 10, "slow"));
@@ -802,8 +872,24 @@ mod tests {
         // Identical responses except content type: html vs json must split.
         let mut features = Vec::new();
         for i in 0..6 {
-            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("html-{}", i), "text/html"));
-            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("json-{}", i), "application/json"));
+            features.push(feat_ct(
+                200,
+                1000,
+                100,
+                50,
+                5,
+                &format!("html-{}", i),
+                "text/html",
+            ));
+            features.push(feat_ct(
+                200,
+                1000,
+                100,
+                50,
+                5,
+                &format!("json-{}", i),
+                "application/json",
+            ));
         }
         let result = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
 
@@ -819,7 +905,15 @@ mod tests {
         // must be flagged as noise.
         let mut features = Vec::new();
         for i in 0..8 {
-            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("html-{}", i), "text/html"));
+            features.push(feat_ct(
+                200,
+                1000,
+                100,
+                50,
+                5,
+                &format!("html-{}", i),
+                "text/html",
+            ));
         }
         features.push(feat_ct(200, 1000, 100, 50, 5, "json", "application/json"));
         let result = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
@@ -834,8 +928,24 @@ mod tests {
         // "text/html; charset=UTF-8" lands in the text/html column.
         let mut features = Vec::new();
         for i in 0..6 {
-            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("a-{}", i), "text/html; charset=UTF-8"));
-            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("b-{}", i), "text/html"));
+            features.push(feat_ct(
+                200,
+                1000,
+                100,
+                50,
+                5,
+                &format!("a-{}", i),
+                "text/html; charset=UTF-8",
+            ));
+            features.push(feat_ct(
+                200,
+                1000,
+                100,
+                50,
+                5,
+                &format!("b-{}", i),
+                "text/html",
+            ));
         }
         let result = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
 
@@ -851,8 +961,24 @@ mod tests {
         // json response is the outlier.
         let mut features = Vec::new();
         for i in 0..6 {
-            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("weird-{}", i), "Text/HTML; charset=UTF-8"));
-            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("html-{}", i), "text/html"));
+            features.push(feat_ct(
+                200,
+                1000,
+                100,
+                50,
+                5,
+                &format!("weird-{}", i),
+                "Text/HTML; charset=UTF-8",
+            ));
+            features.push(feat_ct(
+                200,
+                1000,
+                100,
+                50,
+                5,
+                &format!("html-{}", i),
+                "text/html",
+            ));
         }
         features.push(feat_ct(200, 1000, 100, 50, 5, "json", "application/json"));
         let result = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
@@ -868,9 +994,25 @@ mod tests {
         // html, missing header, and an unknown type: three groups.
         let mut features = Vec::new();
         for i in 0..5 {
-            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("html-{}", i), "text/html"));
+            features.push(feat_ct(
+                200,
+                1000,
+                100,
+                50,
+                5,
+                &format!("html-{}", i),
+                "text/html",
+            ));
             features.push(feat_ct(200, 1000, 100, 50, 5, &format!("none-{}", i), ""));
-            features.push(feat_ct(200, 1000, 100, 50, 5, &format!("gif-{}", i), "image/gif"));
+            features.push(feat_ct(
+                200,
+                1000,
+                100,
+                50,
+                5,
+                &format!("gif-{}", i),
+                "image/gif",
+            ));
         }
         let result = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
 
