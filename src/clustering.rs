@@ -613,13 +613,20 @@ pub fn analyze_clusters(result: &DbscanResult, ttfb_ref: Option<(u16, f64, f64)>
         let mut content_types_v: Vec<(String, u64)> = content_types.into_iter().collect();
         content_types_v.sort_by(|a, b| b.1.cmp(&a.1));
         let top_content_types_str: String = content_types_v
-            .iter().take(5)
+            .iter()
+            .take(5)
             .map(|(k, v)| format!("{}: {}", k, v))
             .collect::<Vec<_>>()
             .join(", ");
 
-        observations.push(format!("    Unique Content-Types: {}", content_types_v.len()));
-        observations.push(format!("     {}", top_content_types_str));
+        if content_types_v.len() == 1 {
+            observations.push(format!(
+                "    Unique Content-Types: {}",
+                content_types_v.len()
+            ));
+        }
+
+        observations.push(format!("    Content-Types: {}", top_content_types_str));
 
         let lengths: Vec<u64> = cluster
             .features
