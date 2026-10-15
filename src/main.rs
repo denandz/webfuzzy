@@ -3,7 +3,8 @@ use webfuzzy::baseline;
 use webfuzzy::cli::{Args, Config};
 use webfuzzy::fuzzing;
 use webfuzzy::http_client::HttpClient;
-use webfuzzy::logging::AuditLogger;
+use webfuzzy::logging::{AuditLogger, ScanInfo};
+use webfuzzy::replay;
 use webfuzzy::reporting;
 
 #[tokio::main]
@@ -14,7 +15,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = &config.args;
     let method = args.method.as_deref().unwrap();
 
-    let url = args.url.clone().ok_or("URL is required")?;
+    // Offline mode: re-compute clustering from a previous run's report
+    // file without sending any requests. No audit logger - the input file
+    // is only ever read.
+    if let Some(ref report_path) = args.report {
+        return replay::run_replay(args, report_path);
+    }
+
+    let url = args.url.clone()
+        .ok_or("either --url (live scan) or --report <file> (offline re-analysis) is required")?;
 
     println!("{}", "Webfuzzy - Web Request Fuzzer");
     println!("{}", "=".repeat(40));
@@ -86,6 +95,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let fuzz_result = fuzzing::run_fuzzing(&http_client, args, &baseline_results).await?;
     reporting::print_fuzzing_summary(&fuzz_result);
     reporting::print_outlier_details(&fuzz_result);
+
+    // End-of-run report: scan metadata, baseline, and the full fuzzing
+    // result so the run can be re-analyzed offline with `--report`.
+    let scan_info = ScanInfo {
+        tool_version: env!("CARGO_PKG_VERSION").to_string(),
+        run_id: config.run_id.clone(),
+        target_url: url.clone(),
+        method: method.to_string(),
+        start_time: config.started_at.clone(),
+        end_time: Some(
+            chrono::Utc::now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        ),
+        arguments: std::env::args().collect(),
+    };
+    match audit_logger.save_report(&scan_info, &baseline_results, &fuzz_result) {
+        Ok(path) => println!("\n[+] Report saved to '{}'", path.display()),
+        Err(e) => eprintln!("[!] failed to save report: {e}"),
+    }
 
     audit_logger.close();
     Ok(())

@@ -7,3 +7,4 @@ pub mod marker;
 pub mod fuzzing;
 pub mod clustering;
 pub mod reporting;
+pub mod replay;

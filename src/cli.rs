@@ -13,7 +13,7 @@ use std::path::PathBuf;
 )]
 pub struct Args {
     /// Target URL
-    #[arg(short, long, required = true)]
+    #[arg(short, long)]
     pub url: Option<String>,
 
     /// HTTP headers in format 'Name: Value' (repeatable). Wrap the original
@@ -80,6 +80,12 @@ pub struct Args {
     /// TLDR: we don't really care about ~50ms of wobble by default
     #[arg(long, default_value_t = 50.0)]
     pub timing_jitter: f64,
+
+    /// Offline re-analysis: read a previous run's report file
+    /// and re-compute the DBSCAN clustering from the recorded
+    /// responses.
+    #[arg(long)]
+    pub report: Option<PathBuf>,
 }
 
 impl Args {

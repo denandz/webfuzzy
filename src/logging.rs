@@ -7,17 +7,23 @@ use chrono::Utc;
 use serde::{Deserialize, Serialize};
 
 use crate::baseline::BaselineResult;
+use crate::fuzzing::FuzzingResult;
 use crate::http_client::{HttpRequest, HttpResponse, RequestResult};
 
 /// Real-time jsonl logs bigger than this (1MB) are xz-compressed on close.
 const XZ_THRESHOLD: u64 = 1_000_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AuditLog {
+pub struct Report {
     pub summary: ScanSummary,
     pub version: String,
     pub scan_info: ScanInfo,
     pub baseline: Option<BaselineResult>,
+    /// Full fuzzing stage result (response features + clustering) so a
+    /// previous run can be re-analyzed offline (`--report`) without
+    /// re-sending requests.
+    #[serde(default)]
+    pub fuzzing: Option<FuzzingResult>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,14 +212,16 @@ impl AuditLogger {
         }
     }
 
-    /// Write the single end-of-run result file: scan metadata (including the
-    /// run hash), baseline, check findings, and the full fuzzing result
-    /// (features + clusters) in one JSON document. The raw per-request record
-    /// lives exclusively in the real-time jsonl (`jsonl_path`).
-    pub fn save_audit_log(
+    /// Write the single end-of-run report file: scan metadata (including the
+    /// run hash), baseline, and the full fuzzing result (features +
+    /// clusters) in one JSON document. The report is a summary snapshot; the
+    /// raw per-request record lives exclusively in the real-time audit jsonl
+    /// (`jsonl_path`).
+    pub fn save_report(
         &self,
         scan_info: &ScanInfo,
         baseline: &BaselineResult,
+        fuzzing: &FuzzingResult,
     ) -> Result<PathBuf, Box<dyn std::error::Error>> {
         let inner = self.inner.lock().unwrap();
 
@@ -222,18 +230,19 @@ impl AuditLogger {
             baseline_stable: baseline.stable,
         };
 
-        let audit_log = AuditLog {
+        let report = Report {
             summary,
             version: env!("CARGO_PKG_VERSION").to_string(),
             scan_info: scan_info.clone(),
             baseline: Some(baseline.clone()),
+            fuzzing: Some(fuzzing.clone()),
         };
 
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
         let output_path = inner
             .output_dir
-            .join(format!("audit_{}_{}.json", timestamp, inner.file_id));
-        let json = serde_json::to_string_pretty(&audit_log)?;
+            .join(format!("report_{}_{}.json", timestamp, inner.file_id));
+        let json = serde_json::to_string_pretty(&report)?;
         std::fs::write(&output_path, json)?;
 
         Ok(output_path)
