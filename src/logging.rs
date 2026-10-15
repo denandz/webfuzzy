@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::baseline::BaselineResult;
 use crate::fuzzing::FuzzingResult;
-use crate::http_client::{HttpRequest, HttpResponse, RequestResult};
+use crate::http_client::{HttpRequest, HttpResponse};
 
 /// Real-time jsonl logs bigger than this (1MB) are xz-compressed on close.
 const XZ_THRESHOLD: u64 = 1_000_000;
@@ -41,7 +41,9 @@ pub struct ScanInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanSummary {
-    pub total_requests: usize,
+    pub total_requests: u64,
+    pub total_responses: u64,
+    pub total_errors: u64,
     pub baseline_stable: bool,
 }
 
@@ -58,7 +60,9 @@ struct AuditLoggerInner {
     /// Path of the real-time jsonl request log.
     log_path: PathBuf,
     log_file: Option<File>,
-    requests: Vec<RequestResult>,
+    total_requests: u64,
+    total_responses: u64,
+    total_errors: u64,
 }
 
 impl AuditLogger {
@@ -106,20 +110,17 @@ impl AuditLogger {
                 file_id: id,
                 log_path,
                 log_file,
-                requests: Vec::new(),
+                total_requests: 0,
+                total_responses: 0,
+                total_errors: 0,
             })),
         }
-    }
-
-    /// Add a requstresult object to the logger
-    pub fn add_requestresult(&self, result: &RequestResult) {
-        let mut inner = self.inner.lock().unwrap();
-        inner.requests.push(result.clone());
     }
 
     /// Log an http request
     pub fn log_request(&self, request: &HttpRequest) {
         let mut inner = self.inner.lock().unwrap();
+        inner.total_requests += 1;
 
         if let Some(ref mut file) = inner.log_file {
             let entry = serde_json::json!({
@@ -137,6 +138,7 @@ impl AuditLogger {
     /// Log an http response
     pub fn log_response(&self, response: &HttpResponse) {
         let mut inner = self.inner.lock().unwrap();
+        inner.total_responses += 1;
 
         if let Some(ref mut file) = inner.log_file {
             let entry = serde_json::json!({
@@ -154,6 +156,7 @@ impl AuditLogger {
     /// Log an error
     pub fn log_error(&self, id: &String, err: &String) {
         let mut inner = self.inner.lock().unwrap();
+        inner.total_errors += 0;
 
         if let Some(ref mut file) = inner.log_file {
             let entry = serde_json::json!({
@@ -226,7 +229,9 @@ impl AuditLogger {
         let inner = self.inner.lock().unwrap();
 
         let summary = ScanSummary {
-            total_requests: inner.requests.len(),
+            total_requests: inner.total_requests,
+            total_responses: inner.total_responses,
+            total_errors: inner.total_errors,
             baseline_stable: baseline.stable,
         };
 
@@ -243,9 +248,39 @@ impl AuditLogger {
             .output_dir
             .join(format!("report_{}_{}.json", timestamp, inner.file_id));
         let json = serde_json::to_string_pretty(&report)?;
+        let len = json.len().try_into().unwrap_or(0);
         std::fs::write(&output_path, json)?;
 
-        Ok(output_path)
+        if len <= XZ_THRESHOLD {
+            return Ok(output_path);
+        }
+
+        let xz_path = output_path.with_extension("json.xz");
+        match compress_xz_path(&output_path, &xz_path) {
+            Ok(()) => {
+                if let Err(e) = std::fs::remove_file(&output_path) {
+                    eprintln!(
+                        "[!] compressed report but could not remove '{}': {} (both files kept)",
+                        inner.log_path.display(),
+                        e
+                    );
+                }
+                eprintln!(
+                    "[*] report log was {} bytes (>1MB), saved as '{}'",
+                    len,
+                    xz_path.display()
+                );
+                Ok(xz_path)
+            }
+            Err(e) => {
+                eprintln!(
+                    "[!] failed to compress report '{}': {} - keeping the uncompressed file",
+                    inner.log_path.display(),
+                    e
+                );
+                Err(Box::new(e))
+            }
+        }
     }
 }
 
@@ -258,4 +293,9 @@ fn compress_xz(file: File, xz_path: &Path) -> std::io::Result<()> {
     let mut out = File::create(xz_path)?;
     std::io::copy(&mut encoder, &mut out)?;
     out.sync_all()
+}
+
+fn compress_xz_path(in_path: &Path, xz_path: &Path) -> std::io::Result<()> {
+    let file = File::open(in_path)?;
+    compress_xz(file, xz_path)
 }
