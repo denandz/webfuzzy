@@ -51,7 +51,7 @@ Options:
       --timing-jitter <TIMING_JITTER>ms
           TTFB jitter floor in ms: any status family's TTFB jitter below this is raised to it, so normal endpoint wobble is absorbed into the bulk. TLDR: we don't really care about ~50ms of wobble by default [default: 50]
       --report <REPORT>
-          Offline re-analysis: read a previous run's end-of-run report file (report_*.json), re-compute the DBSCAN clustering from the recorded responses, and display the results without sending any requests.
+          Offline re-analysis: read a previous run's end-of-run report file (report_*.json, or report_*.json.xz for runs auto-compressed for size), re-compute the DBSCAN clustering from the recorded responses, and display the results without sending any requests.
   -h, --help
           Print help (see more with '--help')
   -V, --version
@@ -63,7 +63,7 @@ Options:
 - DBSCAN clustering of response data to classify endpoint behaviour quickly, and find outliers (noise). - Curl argument interop. Arguments are as-close-as-possible to `curl`, so any tool that offers a `copy as curl` function (browsers, testing tools) can easily be pasted into a webfuzzy run
 - Sensible defaults, aiming for minimal runtime configuration.
 - Auditability. All HTTP requests and responses sent/recieved by webfuzzy are written to a real-time `jsonl` audit log in the current directory by default. If the user needs to investigate some condition such as a server crash, this log contains all data sent/recieved by the `http_client.rs` HTTP client. When the log exceeds 1MB it is automatically xz-compressed since full-payload logs get large fast.
-- Reanalyzing Data. When a fuzz run is complete, this data should be analysable with different clustering parameters without re-running the tool again. At the end of each run a `report_*.json` file is written alongside the audit log, containing the scan metadata, baseline, and the full fuzzing result (response features + clustering). `--report <file>` re-computes the clustering from that file offline, which lets the user analyse an existing run with different `--max-clusters`/`--disable-timing`/`--timing-jitter` settings.
+- Reanalyzing Data. When a fuzz run is complete, this data should be analysable with different clustering parameters without re-running the tool again. At the end of each run a `report_*.json` file is written alongside the audit log, containing the scan metadata, baseline, and the full fuzzing result (response features + clustering). `--report <file>` re-computes the clustering from that file offline, which lets the user analyse an existing run with different `--max-clusters`/`--disable-timing`/`--timing-jitter` settings. Reports larger than 1MB are automatically saved xz-compressed as `report_*.json.xz`; `--report` accepts that form directly and decodes it on the fly.
 
 # Clustering
 

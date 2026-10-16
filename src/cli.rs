@@ -82,8 +82,8 @@ pub struct Args {
     pub timing_jitter: f64,
 
     /// Offline re-analysis: read a previous run's report file
-    /// and re-compute the DBSCAN clustering from the recorded
-    /// responses.
+    /// (report_*.json or report_*.json.xz) and re-compute the DBSCAN
+    /// clustering from the recorded responses.
     #[arg(long)]
     pub report: Option<PathBuf>,
 }
