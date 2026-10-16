@@ -116,16 +116,33 @@ pub fn print_outlier_details(fuzzing: &FuzzingResult) {
             );
             println!("    Status: {}", feature.status_code);
 
+            // Whether this status family has any surviving cluster, i.e. any
+            // true inliers to measure against. A family with fewer responses
+            // than DBSCAN's min_samples can never form a cluster. Handles the
+            // case where a fuzz run has <3 responses in a certain status code
+            // e.g., the fuzz run only saw 2 401 responses.
+            let family_has_inliers = fuzzing.clustering_result.clusters.iter().any(|c| {
+                c.features
+                    .first()
+                    .is_some_and(|f| f.status_code == feature.status_code)
+            });
+
             // Per-feature distance to the nearest inlier neighbour, in sigma
             // units of the family's z-space; '*' marks the dominant feature.
-            let distance = fuzzing
-                .clustering_result
-                .outlier_distances
-                .get(&outlier_idx)
-                .map(feature_distances);
-            let dominant = distance
-                .as_ref()
-                .and_then(|d| d.iter().max_by(|a, b| a.3.total_cmp(&b.3)).map(|(name, ..)| *name));
+            let distance = family_has_inliers
+                .then(|| {
+                    fuzzing
+                        .clustering_result
+                        .outlier_distances
+                        .get(&outlier_idx)
+                        .map(feature_distances)
+                })
+                .flatten();
+            let dominant = distance.as_ref().and_then(|d| {
+                d.iter()
+                    .max_by(|a, b| a.3.total_cmp(&b.3))
+                    .map(|(name, ..)| *name)
+            });
 
             // "[dist X.XXσ]" next to a feature line; '*' on the dominant
             // feature. Empty when the feature has no distance (timing
@@ -173,7 +190,8 @@ pub fn print_outlier_details(fuzzing: &FuzzingResult) {
             );
 
             if let Some(distance) = &distance {
-                let nearest_entry = fuzzing.clustering_result.outlier_distances[&outlier_idx].nearest_entry;
+                let nearest_entry =
+                    fuzzing.clustering_result.outlier_distances[&outlier_idx].nearest_entry;
                 let total: f64 = distance.iter().map(|(_, _, _, sq)| *sq).sum::<f64>().sqrt();
                 let dominant_name = dominant
                     .and_then(|name| distance.iter().find(|(n, ..)| *n == name))
@@ -181,6 +199,16 @@ pub fn print_outlier_details(fuzzing: &FuzzingResult) {
                     .unwrap_or("none");
                 println!(
                     "    Nearest inlier neighbour: Payload {nearest_entry}, total distance {total:.2}\u{3c3} (dominant: {dominant_name})"
+                );
+            } else if !family_has_inliers {
+                let family_size = fuzzing
+                    .response_features
+                    .iter()
+                    .filter(|f| f.status_code == feature.status_code)
+                    .count();
+                println!(
+                    "    No inlier neighbours: status {} has only {family_size} response(s)",
+                    feature.status_code
                 );
             }
         }
@@ -190,13 +218,25 @@ pub fn print_outlier_details(fuzzing: &FuzzingResult) {
 /// Per-feature sigma distances of one outlier: (feature name, display label,
 /// sigma distance or None, squared component) in the scaled-matrix column
 /// order. A None sigma means the feature was absent (timing disabled).
-fn feature_distances(d: &clustering::OutlierDistance) -> Vec<(&'static str, &'static str, Option<f64>, f64)> {
+fn feature_distances(
+    d: &clustering::OutlierDistance,
+) -> Vec<(&'static str, &'static str, Option<f64>, f64)> {
     vec![
         ("length", "Length", Some(d.length_sq.sqrt()), d.length_sq),
-        ("ttfb", "TTFB", d.ttfb_sq.map(|sq| sq.sqrt()), d.ttfb_sq.unwrap_or(0.0)),
+        (
+            "ttfb",
+            "TTFB",
+            d.ttfb_sq.map(|sq| sq.sqrt()),
+            d.ttfb_sq.unwrap_or(0.0),
+        ),
         ("words", "Words", Some(d.words_sq.sqrt()), d.words_sq),
         ("lines", "Lines", Some(d.lines_sq.sqrt()), d.lines_sq),
-        ("content type", "Content-Type", Some(d.content_type_sq.sqrt()), d.content_type_sq),
+        (
+            "content type",
+            "Content-Type",
+            Some(d.content_type_sq.sqrt()),
+            d.content_type_sq,
+        ),
     ]
 }
 
