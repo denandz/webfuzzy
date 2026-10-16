@@ -939,6 +939,7 @@ mod tests {
         payload: &str,
     ) -> ResponseFeatures {
         ResponseFeatures {
+            request_id: "00000000-0000-0000-0000-000000000000".into(),
             status_code: status,
             content_type: "text/html".into(),
             response_length: len,

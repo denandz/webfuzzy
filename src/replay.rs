@@ -152,6 +152,7 @@ mod tests {
 
     fn sample_report() -> Report {
         let features = ResponseFeatures {
+            request_id: "00000000-0000-0000-0000-000000000000".into(),
             status_code: 200,
             content_type: "text/html".into(),
             response_length: 100,

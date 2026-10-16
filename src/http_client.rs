@@ -48,6 +48,7 @@ pub struct RequestResult {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResponseFeatures {
+    pub request_id: String,
     pub status_code: u16,
     pub content_type: String,
     pub response_length: usize,
@@ -61,6 +62,7 @@ pub struct ResponseFeatures {
 impl From<&HttpResponse> for ResponseFeatures {
     fn from(response: &HttpResponse) -> Self {
         Self {
+            request_id: response.request_id.clone(),
             status_code: response.status_code,
             content_type: response
                 .headers
