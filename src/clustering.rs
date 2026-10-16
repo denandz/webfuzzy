@@ -32,6 +32,28 @@ pub struct DbscanResult {
     /// Status families where reflection was detected: (status, Pearson r).
     #[serde(default)]
     pub reflection: Vec<(u16, f64)>,
+    /// Per-outlier distance to the nearest clustered (inlier) neighbour, keyed by the
+    /// outlier's response index.
+    pub outlier_distances: HashMap<usize, OutlierDistance>,
+}
+
+/// Per-feature distance from one outlier to its nearest clustered (inlier) neighbour,
+/// measured in the outlier's family's z-scored feature space - the same
+/// space DBSCAN clustered in. A "family" is one status code: the set of all
+/// responses sharing it. Every `*_sq` component is a squared Euclidean
+/// contribution along one feature; `content_type_sq` aggregates the whole
+/// one-hot block.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OutlierDistance {
+    /// Response index (position in the run-wide features list, the report's
+    /// "Sequence N") of the nearest neighbour.
+    pub nearest_entry: usize,
+    pub length_sq: f64,
+    /// None when timing analysis is disabled and the matrix has no TTFB column.
+    pub ttfb_sq: Option<f64>,
+    pub words_sq: f64,
+    pub lines_sq: f64,
+    pub content_type_sq: f64,
 }
 
 /// Number of continuous features - length, ttfb, words, lines
@@ -142,6 +164,7 @@ pub fn perform_clustering(
             outliers: Vec::new(),
             noise_count: 0,
             reflection: Vec::new(),
+            outlier_distances: HashMap::new(),
         };
     }
 
@@ -172,26 +195,17 @@ pub fn perform_clustering(
         if let Some((r, _slope)) = regression {
             reflection.push((*status, r));
         }
-        let mut data = features_to_array(&group_feats, include_timing, regression);
+        let family = family_scaled_matrix(
+            &group_feats,
+            include_timing,
+            regression,
+            *status,
+            ttfb_ref,
+            jitter_ms,
+        );
 
-        let mut scaler = Scaler::fit(&data);
-        if include_timing {
-            // TTFB column: when this family is the baseline's, scale against
-            // the baseline's own jitter so normal endpoint wobble is absorbed
-            // and only real timing anomalies stand out.
-            if let Some((ref_status, ref_mean, ref_sigma)) = ttfb_ref {
-                if ref_status == *status {
-                    scaler.set_scale(1, ref_mean, ref_sigma);
-                }
-            }
-            // Set the scaler's TTFB stddev to the jitter floor so millisecond
-            // wobble isn't flagged as timing outliers. No-ops when the data
-            // is naturally more variable than the floor.
-            scaler.std[1] = scaler.std[1].max(jitter_ms);
-        }
-        scaler.transform(&mut data);
-
-        let dataset = DatasetBase::from(data);
+        let dataset = DatasetBase::from(family.matrix);
+        let scaler = family.scaler;
 
         let cluster_memberships = Dbscan::params(min_samples)
             .tolerance(tolerance)
@@ -254,6 +268,20 @@ pub fn perform_clustering(
     outliers.sort();
     let noise_count = outliers.len();
 
+    // Per-outlier distances to the nearest surviving inlier neighbour, in
+    // the family's z-space. Runs after the max_clusters demotion above:
+    // `order` holds only the surviving clusters (`final_clusters` still
+    // contains the demoted ones, indexed by their original position).
+    let surviving_clusters: Vec<&Cluster> = order.iter().map(|&c| &final_clusters[c]).collect();
+    let outlier_distances = outlier_distances(
+        features,
+        &surviving_clusters,
+        &outliers,
+        include_timing,
+        ttfb_ref,
+        jitter_ms,
+    );
+
     let mut slots: Vec<Option<Cluster>> = final_clusters.into_iter().map(Some).collect();
     let final_clusters: Vec<Cluster> = order
         .into_iter()
@@ -270,6 +298,7 @@ pub fn perform_clustering(
         outliers,
         noise_count,
         reflection,
+        outlier_distances,
     }
 }
 
@@ -368,6 +397,235 @@ fn content_type_column(content_type: &str) -> usize {
         known += 1;
     }
     if ct.is_empty() { known } else { known + 1 }
+}
+
+/// One status code family scaled to its z-space. This is the single source
+/// of truth for family scaling: the per-family DBSCAN matrix and the outlier
+/// distance pass both build their scaled rows through here, so the two cant
+/// diverge.
+struct FamilyScaled {
+    /// Rows in the given response order; columns: length, (ttfb), words,
+    /// lines, one-hot content-type block.
+    matrix: Array2<f64>,
+    /// The fitted scaler, for follow-up math on the same z-space
+    /// (e.g. `find_representative`).
+    scaler: Scaler,
+}
+
+fn family_scaled_matrix(
+    features: &[&ResponseFeatures],
+    include_timing: bool,
+    regression: Option<(f64, f64)>,
+    status: u16,
+    ttfb_ref: Option<(u16, f64, f64)>,
+    jitter_ms: f64,
+) -> FamilyScaled {
+    let mut data = features_to_array(features, include_timing, regression);
+
+    let mut scaler = Scaler::fit(&data);
+    if include_timing {
+        // TTFB column: when this family is the baseline's, scale against
+        // the baseline's own jitter so normal endpoint wobble is absorbed
+        // and only real timing anomalies stand out.
+        if let Some((ref_status, ref_mean, ref_sigma)) = ttfb_ref {
+            if ref_status == status {
+                scaler.set_scale(1, ref_mean, ref_sigma);
+            }
+        }
+        // Set the scaler's TTFB stddev to the jitter floor so millisecond
+        // wobble isn't flagged as timing outliers. No-ops when the data is
+        // naturally more variable than the floor.
+        scaler.std[1] = scaler.std[1].max(jitter_ms);
+    }
+    scaler.transform(&mut data);
+
+    FamilyScaled {
+        matrix: data,
+        scaler,
+    }
+}
+
+/// Column index of a feature in the scaled matrix layout:
+/// 0=length, 1=TTFB (only when timing is enabled), 2=words, 3=lines, then
+/// the one-hot content-type block. Shared with the outlier distance pass so
+/// the components map to the same columns DBSCAN clustered in.
+fn feature_column(name: &str, include_timing: bool) -> usize {
+    match name {
+        "length" => 0,
+        "ttfb" if include_timing => 1,
+        "words" => {
+            if include_timing {
+                2
+            } else {
+                1
+            }
+        }
+        "lines" => {
+            if include_timing {
+                3
+            } else {
+                2
+            }
+        }
+        _ => panic!("unknown feature column: {}", name),
+    }
+}
+
+/// For each outlier, the per-feature distance to its nearest inlier
+/// neighbour, measured in the outlier's family's z-scored feature space -
+/// the exact space DBSCAN clustered in, via `family_scaled_matrix`.
+///
+/// Must run after the max_clusters demotion: candidates are members of
+/// surviving clusters only. When the outlier's family has no surviving
+/// cluster, the candidates fall back to all same-status responses except
+/// the outlier itself.
+fn outlier_distances(
+    features: &[ResponseFeatures],
+    clusters: &[&Cluster],
+    outliers: &[usize],
+    include_timing: bool,
+    ttfb_ref: Option<(u16, f64, f64)>,
+    jitter_ms: f64,
+) -> HashMap<usize, OutlierDistance> {
+    let mut distances: HashMap<usize, OutlierDistance> = HashMap::new();
+    if features.is_empty() || outliers.is_empty() {
+        return distances;
+    }
+
+    // All response indices grouped by status code, run-wide order kept.
+    let responses_by_status: BTreeMap<u16, Vec<usize>> =
+        features
+            .iter()
+            .enumerate()
+            .fold(BTreeMap::new(), |mut acc, (i, f)| {
+                acc.entry(f.status_code).or_default().push(i);
+                acc
+            });
+
+    // Response indices of surviving cluster members, grouped by family
+    // status code. Cluster members are clones of the run-wide features, so
+    // membership is recovered by value equality; if two responses are
+    // feature-identical, either index is equivalent (their scaled rows are
+    // identical). Clustering is per status code, so every member of a
+    // cluster shares one status: features[0].status_code is a safe family
+    // tag (clusters are never empty).
+    let mut members_by_status: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
+    for cluster in clusters {
+        let family_status = cluster.features[0].status_code;
+        for member in &cluster.features {
+            if let Some(response_index) = features.iter().position(|f| f == member) {
+                members_by_status
+                    .entry(family_status)
+                    .or_default()
+                    .push(response_index);
+            }
+        }
+    }
+
+    // Outliers grouped by their own family's status code, so each family's
+    // scaler is fitted exactly once.
+    let mut outliers_by_status: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
+    for &outlier in outliers {
+        let status = features[outlier].status_code;
+        outliers_by_status.entry(status).or_default().push(outlier);
+    }
+
+    for (status, outlier_indices) in &outliers_by_status {
+        // Same population the per-family DBSCAN path scaled: every response
+        // with this status, so the fitted scaler is identical to the one
+        // clustering used.
+        let family_indices = &responses_by_status[status];
+        let family_features: Vec<&ResponseFeatures> =
+            family_indices.iter().map(|&i| &features[i]).collect();
+        let regression = reflection_regression(&family_features);
+        let scaled = family_scaled_matrix(
+            &family_features,
+            include_timing,
+            regression,
+            *status,
+            ttfb_ref,
+            jitter_ms,
+        )
+        .matrix;
+
+        // Row (a coordinate inside this family's scaled matrix) for every
+        // response index of the family.
+        let row_of: HashMap<usize, usize> = family_indices
+            .iter()
+            .enumerate()
+            .map(|(r, &i)| (i, r))
+            .collect();
+
+        // Candidates: surviving inlier members of this family, or - when the
+        // family has no surviving cluster - all same-status responses.
+        let members = members_by_status.get(status).filter(|m| !m.is_empty());
+
+        for &outlier in outlier_indices {
+            let Some(&row) = row_of.get(&outlier) else {
+                continue;
+            };
+            let mut best: Option<(usize, f64)> = None; // (response index, total squared distance)
+
+            let scan = |candidate: usize, best: &mut Option<(usize, f64)>| {
+                if candidate == outlier {
+                    return;
+                }
+                let Some(candidate_row) = row_of.get(&candidate) else {
+                    return;
+                };
+                let mut total_sq = 0.0;
+                for j in 0..scaled.ncols() {
+                    let d = scaled[[row, j]] - scaled[[*candidate_row, j]];
+                    total_sq += d * d;
+                }
+                if best.is_none_or(|(_, best_sq)| total_sq < best_sq) {
+                    *best = Some((candidate, total_sq));
+                }
+            };
+
+            match members {
+                Some(members) => {
+                    for &candidate in members {
+                        scan(candidate, &mut best);
+                    }
+                }
+                None => {
+                    for &candidate in family_indices {
+                        scan(candidate, &mut best);
+                    }
+                }
+            }
+
+            let Some((nearest, _total_sq)) = best else {
+                continue;
+            };
+            let nearest_row = row_of[&nearest];
+
+            // Squared components in the same column order as the scaled
+            // matrix; the one-hot block is summed into a single value.
+            let component_sq = |j: usize| {
+                let d = scaled[[row, j]] - scaled[[nearest_row, j]];
+                d * d
+            };
+            let first_ct_column = feature_column("lines", include_timing) + 1;
+            let content_type_sq: f64 = (first_ct_column..scaled.ncols()).map(component_sq).sum();
+
+            distances.insert(
+                outlier,
+                OutlierDistance {
+                    nearest_entry: nearest,
+                    length_sq: component_sq(feature_column("length", include_timing)),
+                    ttfb_sq: include_timing
+                        .then(|| component_sq(feature_column("ttfb", include_timing))),
+                    words_sq: component_sq(feature_column("words", include_timing)),
+                    lines_sq: component_sq(feature_column("lines", include_timing)),
+                    content_type_sq,
+                },
+            );
+        }
+    }
+
+    distances
 }
 
 /// Dense feature matrix: [length, (ttfb), words, lines, one-hot content
@@ -994,6 +1252,144 @@ mod tests {
         let sizes: Vec<usize> = result.clusters.iter().map(|c| c.features.len()).collect();
         assert_eq!(sizes, vec![6, 6]);
         assert_eq!(result.outliers, vec![12]);
+    }
+
+    #[test]
+    fn length_dominant_outlier_distance() {
+        // The far 200 (response index 6) stands out on length alone.
+        let features = mixed_features();
+        let result = perform_clustering(&features, 1.0, 3, 6, true, None, 0.0);
+        assert_eq!(result.outliers, vec![6]);
+
+        let d = &result.outlier_distances[&6];
+        // Nearest neighbour is one of the six identical bulk 200s.
+        assert!(
+            d.nearest_entry < 6,
+            "nearest neighbour must be a bulk 200, got {}",
+            d.nearest_entry
+        );
+        assert_eq!(features[d.nearest_entry].status_code, 200);
+        // Length dominates the per-feature breakdown.
+        let rest = d.words_sq + d.lines_sq + d.content_type_sq + d.ttfb_sq.unwrap_or(0.0);
+        assert!(
+            d.length_sq > rest,
+            "length_sq {} should dominate rest {}",
+            d.length_sq,
+            rest
+        );
+    }
+
+    #[test]
+    fn content_type_dominant_outlier_distance() {
+        // One json response in a sea of html (response index 8): only the
+        // one-hot content-type block differs.
+        let mut features = Vec::new();
+        for i in 0..8 {
+            features.push(feat_ct(
+                200,
+                1000,
+                100,
+                50,
+                5,
+                &format!("html-{}", i),
+                "text/html",
+            ));
+        }
+        features.push(feat_ct(200, 1000, 100, 50, 5, "json", "application/json"));
+        let result = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
+        assert_eq!(result.outliers, vec![8]);
+
+        let d = &result.outlier_distances[&8];
+        assert!(d.nearest_entry < 8);
+        // The one-hot swap is the only difference: a non-trivial z-distance
+        // (the two columns have different sigmas, so it is not exactly 2).
+        assert!(d.content_type_sq > 1.0);
+        let rest = d.length_sq + d.words_sq + d.lines_sq + d.ttfb_sq.unwrap_or(0.0);
+        assert!(
+            d.content_type_sq > rest,
+            "content_type_sq {} should dominate rest {}",
+            d.content_type_sq,
+            rest
+        );
+    }
+
+    #[test]
+    fn words_dominant_outlier_distance() {
+        // One response with a very different word count (response index 8).
+        let mut features = Vec::new();
+        for i in 0..8 {
+            features.push(feat(200, 1000, 100, 50, 5, &format!("w-{}", i)));
+        }
+        features.push(feat(200, 1000, 100, 950, 5, "many-words"));
+        let result = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
+        assert_eq!(result.outliers, vec![8]);
+
+        let d = &result.outlier_distances[&8];
+        assert!(d.nearest_entry < 8);
+        let rest = d.length_sq + d.lines_sq + d.content_type_sq + d.ttfb_sq.unwrap_or(0.0);
+        assert!(
+            d.words_sq > rest,
+            "words_sq {} should dominate rest {}",
+            d.words_sq,
+            rest
+        );
+    }
+
+    #[test]
+    fn demoted_family_falls_back_to_same_status() {
+        // max_clusters=1 demotes the 500 cluster: the demoted 500s become
+        // outliers whose family has no surviving cluster, so the fallback
+        // candidate set is all same-status responses.
+        let features = mixed_features();
+        let result = perform_clustering(&features, 1.0, 3, 1, true, None, 0.0);
+        assert_eq!(result.outliers, vec![6, 7, 8, 9]);
+
+        // Each demoted 500's nearest neighbour is one of the other two
+        // identical 500s, at zero distance.
+        for &o in &[7, 8, 9] {
+            let d = &result.outlier_distances[&o];
+            assert_eq!(
+                features[d.nearest_entry].status_code, 500,
+                "demoted 500 {} should match a 500, got {}",
+                o, d.nearest_entry
+            );
+            let total = d.length_sq
+                + d.words_sq
+                + d.lines_sq
+                + d.content_type_sq
+                + d.ttfb_sq.unwrap_or(0.0);
+            assert!(total == 0.0, "identical 500s must be at zero distance");
+        }
+
+        // The 200 outlier still matches a surviving 200 cluster member.
+        let d = &result.outlier_distances[&6];
+        assert_eq!(features[d.nearest_entry].status_code, 200);
+        assert!(d.length_sq > 0.0);
+    }
+
+    #[test]
+    fn offset_family_outlier_distance() {
+        // ensure distances for all status code families (not just the main one, 0,)
+        // function as expected
+        let mut features = Vec::new();
+        for i in 0..4 {
+            features.push(feat(200, 500, 100, 40, 4, &format!("ok-{}", i)));
+        }
+        for i in 0..4 {
+            features.push(feat(500, 200, 40, 20, 2, &format!("err-{}", i)));
+        }
+        features.push(feat(500, 9000, 40, 20, 2, "far-500")); // response index 8
+
+        let result = perform_clustering(&features, 1.0, 3, 6, true, None, 0.0);
+        assert_eq!(result.outliers, vec![8]);
+
+        let d = &result.outlier_distances[&8];
+        assert!(
+            (4..8).contains(&d.nearest_entry),
+            "500 outlier's nearest neighbour must be a 500 cluster member, got {}",
+            d.nearest_entry
+        );
+        assert!(d.length_sq > 0.0);
     }
 
     #[test]

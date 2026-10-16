@@ -131,6 +131,7 @@ mod tests {
     use super::*;
     use crate::http_client::ResponseFeatures;
     use std::path::PathBuf;
+    use std::collections::HashMap;
 
     /// Scratch dir removed on drop (avoids a `tempfile` dev-dependency).
     struct TmpDir(PathBuf);
@@ -170,6 +171,7 @@ mod tests {
                 outliers: Vec::new(),
                 noise_count: 1,
                 reflection: Vec::new(),
+                outlier_distances: HashMap::new(),
             },
             response_features: vec![features],
             payload_length_correlation: None,

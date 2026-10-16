@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::HashMap;
 use tokio::sync::Semaphore;
 
 use crate::baseline::BaselineResult;
@@ -14,7 +15,7 @@ pub struct FuzzingResult {
     pub total_requests: usize,
     pub successful_requests: usize,
     pub failed_requests: usize,
-    pub status_codes: std::collections::HashMap<u16, usize>,
+    pub status_codes: HashMap<u16, usize>,
     pub clustering_result: DbscanResult,
     pub response_features: Vec<ResponseFeatures>,
     /// Pearson correlation between input payload length and response content length.
@@ -374,6 +375,7 @@ fn create_empty_result() -> FuzzingResult {
             outliers: Vec::new(),
             noise_count: 0,
             reflection: Vec::new(),
+            outlier_distances: std::collections::HashMap::new(),
         },
         response_features: Vec::new(),
         payload_length_correlation: None,

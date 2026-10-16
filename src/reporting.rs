@@ -115,10 +115,89 @@ pub fn print_outlier_details(fuzzing: &FuzzingResult) {
                 feature.payload.as_deref().unwrap_or("")
             );
             println!("    Status: {}", feature.status_code);
-            println!("    Length: {} bytes", feature.response_length);
-            println!("    TTFB: {}ms", feature.time_to_first_byte_ms);
+
+            // Per-feature distance to the nearest inlier neighbour, in sigma
+            // units of the family's z-space; '*' marks the dominant feature.
+            let distance = fuzzing
+                .clustering_result
+                .outlier_distances
+                .get(&outlier_idx)
+                .map(feature_distances);
+            let dominant = distance
+                .as_ref()
+                .and_then(|d| d.iter().max_by(|a, b| a.3.total_cmp(&b.3)).map(|(name, ..)| *name));
+
+            // "[dist X.XXσ]" next to a feature line; '*' on the dominant
+            // feature. Empty when the feature has no distance (timing
+            // disabled) or no neighbour was found.
+            let dist_tag = |sigma: Option<f64>, name: &'static str| -> String {
+                match sigma {
+                    Some(s) if s > 0.0 => {
+                        let star = if Some(name) == dominant { "*" } else { "" };
+                        format!(" [dist {s:.2}\u{3c3}{star}]")
+                    }
+                    _ => String::new(),
+                }
+            };
+            let sigma_of = |name: &'static str| -> Option<f64> {
+                distance
+                    .as_ref()
+                    .and_then(|d| d.iter().find(|(n, _, _, _)| *n == name))
+                    .and_then(|(_, _, sigma, _)| *sigma)
+            };
+
+            println!(
+                "    Length: {} bytes{}",
+                feature.response_length,
+                dist_tag(sigma_of("length"), "length")
+            );
+            println!(
+                "    TTFB: {}ms{}",
+                feature.time_to_first_byte_ms,
+                dist_tag(sigma_of("ttfb"), "ttfb")
+            );
+            println!(
+                "    Words: {}{}",
+                feature.response_words,
+                dist_tag(sigma_of("words"), "words")
+            );
+            println!(
+                "    Lines: {}{}",
+                feature.response_lines,
+                dist_tag(sigma_of("lines"), "lines")
+            );
+            println!(
+                "    Content-Type: {}{}",
+                feature.content_type,
+                dist_tag(sigma_of("content type"), "content type")
+            );
+
+            if let Some(distance) = &distance {
+                let nearest_entry = fuzzing.clustering_result.outlier_distances[&outlier_idx].nearest_entry;
+                let total: f64 = distance.iter().map(|(_, _, _, sq)| *sq).sum::<f64>().sqrt();
+                let dominant_name = dominant
+                    .and_then(|name| distance.iter().find(|(n, ..)| *n == name))
+                    .map(|(_, label, ..)| *label)
+                    .unwrap_or("none");
+                println!(
+                    "    Nearest inlier neighbour: Payload {nearest_entry}, total distance {total:.2}\u{3c3} (dominant: {dominant_name})"
+                );
+            }
         }
     }
+}
+
+/// Per-feature sigma distances of one outlier: (feature name, display label,
+/// sigma distance or None, squared component) in the scaled-matrix column
+/// order. A None sigma means the feature was absent (timing disabled).
+fn feature_distances(d: &clustering::OutlierDistance) -> Vec<(&'static str, &'static str, Option<f64>, f64)> {
+    vec![
+        ("length", "Length", Some(d.length_sq.sqrt()), d.length_sq),
+        ("ttfb", "TTFB", d.ttfb_sq.map(|sq| sq.sqrt()), d.ttfb_sq.unwrap_or(0.0)),
+        ("words", "Words", Some(d.words_sq.sqrt()), d.words_sq),
+        ("lines", "Lines", Some(d.lines_sq.sqrt()), d.lines_sq),
+        ("content type", "Content-Type", Some(d.content_type_sq.sqrt()), d.content_type_sq),
+    ]
 }
 
 fn truncate(s: &str, max_len: usize) -> String {

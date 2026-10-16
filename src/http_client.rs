@@ -46,7 +46,7 @@ pub struct RequestResult {
     pub payload_byte_len: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ResponseFeatures {
     pub status_code: u16,
     pub content_type: String,
