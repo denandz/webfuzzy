@@ -190,15 +190,21 @@ pub fn print_outlier_details(fuzzing: &FuzzingResult) {
             );
 
             if let Some(distance) = &distance {
-                let nearest_entry =
-                    fuzzing.clustering_result.outlier_distances[&outlier_idx].nearest_entry;
+                let od = &fuzzing.clustering_result.outlier_distances[&outlier_idx];
+                let nearest_entry = od.nearest_entry;
+                // Which surviving cluster the neighbour sits in; omitted for
+                // same-status fallback neighbours and pre-field reports.
+                let cluster_tag = od
+                    .nearest_cluster
+                    .map(|c| format!(" (cluster {c})"))
+                    .unwrap_or_default();
                 let total: f64 = distance.iter().map(|(_, _, _, sq)| *sq).sum::<f64>().sqrt();
                 let dominant_name = dominant
                     .and_then(|name| distance.iter().find(|(n, ..)| *n == name))
                     .map(|(_, label, ..)| *label)
                     .unwrap_or("none");
                 println!(
-                    "    Nearest inlier neighbour: Payload {nearest_entry}, total distance {total:.2}\u{3c3} (dominant: {dominant_name})"
+                    "    Nearest inlier neighbour: Payload {nearest_entry}{cluster_tag}, total distance {total:.2}\u{3c3} (dominant: {dominant_name})"
                 );
             } else if !family_has_inliers {
                 let family_size = fuzzing

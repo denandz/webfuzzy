@@ -48,6 +48,11 @@ pub struct OutlierDistance {
     /// Response index (position in the run-wide features list, the report's
     /// "Sequence N") of the nearest neighbour.
     pub nearest_entry: usize,
+    /// Id of the cluster the nearest neighbour belongs to; `None` when the
+    /// neighbour came from the same-status fallback (the family has no
+    /// surviving cluster)
+    #[serde(default)]
+    pub nearest_cluster: Option<usize>,
     pub length_sq: f64,
     /// None when timing analysis is disabled and the matrix has no TTFB column.
     pub ttfb_sq: Option<f64>,
@@ -272,7 +277,12 @@ pub fn perform_clustering(
     // the family's z-space. Runs after the max_clusters demotion above:
     // `order` holds only the surviving clusters (`final_clusters` still
     // contains the demoted ones, indexed by their original position).
-    let surviving_clusters: Vec<&Cluster> = order.iter().map(|&c| &final_clusters[c]).collect();
+    // (final cluster id, cluster) pairs, in final id order.
+    let surviving_clusters: Vec<(usize, &Cluster)> = order
+        .iter()
+        .enumerate()
+        .map(|(id, &c)| (id, &final_clusters[c]))
+        .collect();
     let outlier_distances = outlier_distances(
         features,
         &surviving_clusters,
@@ -481,7 +491,7 @@ fn feature_column(name: &str, include_timing: bool) -> usize {
 /// the outlier itself.
 fn outlier_distances(
     features: &[ResponseFeatures],
-    clusters: &[&Cluster],
+    clusters: &[(usize, &Cluster)],
     outliers: &[usize],
     include_timing: bool,
     ttfb_ref: Option<(u16, f64, f64)>,
@@ -509,15 +519,16 @@ fn outlier_distances(
     // identical). Clustering is per status code, so every member of a
     // cluster shares one status: features[0].status_code is a safe family
     // tag (clusters are never empty).
-    let mut members_by_status: BTreeMap<u16, Vec<usize>> = BTreeMap::new();
-    for cluster in clusters {
+    // (response index, cluster id) pairs of surviving cluster members.
+    let mut members_by_status: BTreeMap<u16, Vec<(usize, usize)>> = BTreeMap::new();
+    for (cluster_id, cluster) in clusters {
         let family_status = cluster.features[0].status_code;
         for member in &cluster.features {
             if let Some(response_index) = features.iter().position(|f| f == member) {
                 members_by_status
                     .entry(family_status)
                     .or_default()
-                    .push(response_index);
+                    .push((response_index, *cluster_id));
             }
         }
     }
@@ -564,9 +575,13 @@ fn outlier_distances(
             let Some(&row) = row_of.get(&outlier) else {
                 continue;
             };
-            let mut best: Option<(usize, f64)> = None; // (response index, total squared distance)
 
-            let scan = |candidate: usize, best: &mut Option<(usize, f64)>| {
+            // (response index, cluster id of the candidate or None, total squared distance)
+            let mut best: Option<(usize, Option<usize>, f64)> = None;
+
+            let scan = |candidate: usize,
+                        cluster: Option<usize>,
+                        best: &mut Option<(usize, Option<usize>, f64)>| {
                 if candidate == outlier {
                     return;
                 }
@@ -578,25 +593,25 @@ fn outlier_distances(
                     let d = scaled[[row, j]] - scaled[[*candidate_row, j]];
                     total_sq += d * d;
                 }
-                if best.is_none_or(|(_, best_sq)| total_sq < best_sq) {
-                    *best = Some((candidate, total_sq));
+                if best.is_none_or(|(_, _, best_sq)| total_sq < best_sq) {
+                    *best = Some((candidate, cluster, total_sq));
                 }
             };
 
             match members {
                 Some(members) => {
-                    for &candidate in members {
-                        scan(candidate, &mut best);
+                    for &(candidate, cluster_id) in members {
+                        scan(candidate, Some(cluster_id), &mut best);
                     }
                 }
                 None => {
                     for &candidate in family_indices {
-                        scan(candidate, &mut best);
+                        scan(candidate, None, &mut best);
                     }
                 }
             }
 
-            let Some((nearest, _total_sq)) = best else {
+            let Some((nearest, nearest_cluster, _total_sq)) = best else {
                 continue;
             };
             let nearest_row = row_of[&nearest];
@@ -614,6 +629,7 @@ fn outlier_distances(
                 outlier,
                 OutlierDistance {
                     nearest_entry: nearest,
+                    nearest_cluster,
                     length_sq: component_sq(feature_column("length", include_timing)),
                     ttfb_sq: include_timing
                         .then(|| component_sq(feature_column("ttfb", include_timing))),
@@ -1270,6 +1286,19 @@ mod tests {
             d.nearest_entry
         );
         assert_eq!(features[d.nearest_entry].status_code, 200);
+        // The recorded neighbour cluster actually contains the neighbour.
+        let cluster_id = d
+            .nearest_cluster
+            .expect("nearest neighbour must belong to a cluster");
+        assert!(
+            result.clusters[cluster_id]
+                .features
+                .iter()
+                .any(|f| f == &features[d.nearest_entry]),
+            "nearest neighbour (entry {}) must be a member of cluster {}",
+            d.nearest_entry,
+            cluster_id
+        );
         // Length dominates the per-feature breakdown.
         let rest = d.words_sq + d.lines_sq + d.content_type_sq + d.ttfb_sq.unwrap_or(0.0);
         assert!(
@@ -1360,12 +1389,15 @@ mod tests {
                 + d.content_type_sq
                 + d.ttfb_sq.unwrap_or(0.0);
             assert!(total == 0.0, "identical 500s must be at zero distance");
+            // Fallback neighbours come from the unclustered family: no cluster.
+            assert!(d.nearest_cluster.is_none());
         }
 
         // The 200 outlier still matches a surviving 200 cluster member.
         let d = &result.outlier_distances[&6];
         assert_eq!(features[d.nearest_entry].status_code, 200);
         assert!(d.length_sq > 0.0);
+        assert!(d.nearest_cluster.is_some());
     }
 
     #[test]
