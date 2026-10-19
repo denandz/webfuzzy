@@ -227,7 +227,11 @@ pub fn perform_clustering(
         }
 
         let mut cluster_results: Vec<(usize, Vec<usize>)> = cluster_map.into_iter().collect();
-        cluster_results.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
+        // Size desc, ties by DBSCAN label: HashMap iteration order is
+        // random, and without the tie-break equal-size clusters (and their
+        // ids, and max_clusters demotion) would shuffle between runs.
+        cluster_results
+            .sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
 
         for (_orig_label, indices) in cluster_results {
             let cluster_features: Vec<ResponseFeatures> =
@@ -1179,6 +1183,23 @@ mod tests {
         assert_eq!(result.noise_count, 0);
         let sizes: Vec<usize> = result.clusters.iter().map(|c| c.features.len()).collect();
         assert_eq!(sizes, vec![6, 6]);
+
+        // Deterministic tie-breaker: equal-size clusters must always get the
+        // same ids (HashMap iteration order must not leak through).
+        for _ in 0..25 {
+            let again = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
+            assert_eq!(
+                again.clusters
+                    .iter()
+                    .map(|c| (c.id, c.features[0].content_type.clone()))
+                    .collect::<Vec<_>>(),
+                result.clusters
+                    .iter()
+                    .map(|c| (c.id, c.features[0].content_type.clone()))
+                    .collect::<Vec<_>>(),
+                "equal-size cluster ids must be stable across runs"
+            );
+        }
     }
 
     #[test]
