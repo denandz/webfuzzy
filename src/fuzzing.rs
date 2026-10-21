@@ -18,7 +18,9 @@ pub struct FuzzingResult {
     pub status_codes: HashMap<u16, usize>,
     pub clustering_result: DbscanResult,
     pub response_features: Vec<ResponseFeatures>,
-    /// Pearson correlation between input payload length and response content length.
+    /// Spearman rank correlation between input payload length and response
+    /// content length - the same estimator the per-family reflection gate
+    /// uses, so the summary reflects the clustering.
     /// `None` when fewer than 2 successful requests are available.
     pub payload_length_correlation: Option<f64>,
     /// Baseline TTFB reference (status, mean, sigma) used to scale the TTFB
@@ -307,7 +309,9 @@ pub async fn run_fuzzing(
                 .map(|resp| (r.payload_byte_len as f64, resp.body.len() as f64))
         })
         .collect();
-    let payload_length_correlation = pearson_correlation(&pairs);
+    let payload_lengths: Vec<f64> = pairs.iter().map(|&(x, _)| x).collect();
+    let response_lengths: Vec<f64> = pairs.iter().map(|&(_, y)| y).collect();
+    let payload_length_correlation = clustering::spearman_rho(&payload_lengths, &response_lengths);
 
     Ok(FuzzingResult {
         total_requests: baseline.request_count + request_results.len(),
@@ -375,34 +379,11 @@ fn create_empty_result() -> FuzzingResult {
             outliers: Vec::new(),
             noise_count: 0,
             reflection: Vec::new(),
+            reflection_slopes: std::collections::BTreeMap::new(),
             outlier_distances: std::collections::HashMap::new(),
         },
         response_features: Vec::new(),
         payload_length_correlation: None,
         ttfb_baseline_ref: None,
     }
-}
-
-/// Compute Pearson correlation coefficient between two sets of values.
-/// Returns `None` if fewer than 2 data points or if either variable has zero variance.
-fn pearson_correlation(pairs: &[(f64, f64)]) -> Option<f64> {
-    let n = pairs.len() as f64;
-    if n < 2.0 {
-        return None;
-    }
-
-    let sum_x: f64 = pairs.iter().map(|&(x, _)| x).sum();
-    let sum_y: f64 = pairs.iter().map(|&(_, y)| y).sum();
-    let sum_xy: f64 = pairs.iter().map(|&(x, y)| x * y).sum();
-    let sum_x2: f64 = pairs.iter().map(|&(x, _)| x * x).sum();
-    let sum_y2: f64 = pairs.iter().map(|&(_, y)| y * y).sum();
-
-    let numerator = n * sum_xy - sum_x * sum_y;
-    let denominator = ((n * sum_x2 - sum_x * sum_x) * (n * sum_y2 - sum_y * sum_y)).sqrt();
-
-    if denominator == 0.0 {
-        return None;
-    }
-
-    Some(numerator / denominator)
 }

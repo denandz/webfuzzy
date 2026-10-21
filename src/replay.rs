@@ -172,6 +172,7 @@ mod tests {
                 outliers: Vec::new(),
                 noise_count: 1,
                 reflection: Vec::new(),
+                reflection_slopes: std::collections::BTreeMap::new(),
                 outlier_distances: HashMap::new(),
             },
             response_features: vec![features],

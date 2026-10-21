@@ -29,9 +29,14 @@ pub struct DbscanResult {
     pub clusters: Vec<Cluster>,
     pub outliers: Vec<usize>,
     pub noise_count: usize,
-    /// Status families where reflection was detected: (status, Pearson r).
+    /// Status families where reflection was detected: (status, Spearman rho).
     #[serde(default)]
     pub reflection: Vec<(u16, f64)>,
+    /// Theil-Sen slope (response bytes per payload byte) of each reflecting
+    /// status code family, so reports can show the reflection residual 
+    /// inside its clusters.
+    #[serde(default)]
+    pub reflection_slopes: BTreeMap<u16, f64>,
     /// Per-outlier distance to the nearest clustered (inlier) neighbour, keyed by the
     /// outlier's response index.
     pub outlier_distances: HashMap<usize, OutlierDistance>,
@@ -169,6 +174,7 @@ pub fn perform_clustering(
             outliers: Vec::new(),
             noise_count: 0,
             reflection: Vec::new(),
+            reflection_slopes: BTreeMap::new(),
             outlier_distances: HashMap::new(),
         };
     }
@@ -190,16 +196,20 @@ pub fn perform_clustering(
     let mut cluster_members: Vec<Vec<usize>> = Vec::new(); // parallel to final_clusters
     let mut outliers: Vec<usize> = Vec::new();
     let mut reflection: Vec<(u16, f64)> = Vec::new();
+    let mut reflection_slopes: BTreeMap<u16, f64> = BTreeMap::new();
     for (status, global_indices) in features_by_status.iter() {
         // Get all the features for a given status code
         let group_feats: Vec<&ResponseFeatures> =
             global_indices.iter().map(|&i| &features[i]).collect();
+
         // Reflected payloads make the response length track the payload
         // length, fragmenting the cluster; regress it out when detected.
         let regression = reflection_regression(&group_feats);
-        if let Some((r, _slope)) = regression {
+        if let Some((r, slope)) = regression {
             reflection.push((*status, r));
+            reflection_slopes.insert(*status, slope);
         }
+
         let family = family_scaled_matrix(
             &group_feats,
             include_timing,
@@ -227,6 +237,7 @@ pub fn perform_clustering(
         }
 
         let mut cluster_results: Vec<(usize, Vec<usize>)> = cluster_map.into_iter().collect();
+
         // Size desc, ties by DBSCAN label: HashMap iteration order is
         // random, and without the tie-break equal-size clusters (and their
         // ids, and max_clusters demotion) would shuffle between runs.
@@ -312,6 +323,7 @@ pub fn perform_clustering(
         outliers,
         noise_count,
         reflection,
+        reflection_slopes,
         outlier_distances,
     }
 }
@@ -338,43 +350,108 @@ fn payload_len(feature: &ResponseFeatures) -> f64 {
         .unwrap_or(0.0)
 }
 
-/// (Pearson r, slope) of response length regressed on payload length, when
-/// r exceeds the reflection threshold. The slope covers decoders too, where
-/// the reflected length is a fraction of the payload length.
+/// Spearman rank correlation of paired values; None when undefined (fewer
+/// than two points, or zero variance on either axis). Used for both the 
+/// the per-family reflection gate and the run-level summary, so the
+/// two report the same estimator. Spearman == ranked Pearson
+pub fn spearman_rho(xs: &[f64], ys: &[f64]) -> Option<f64> {
+    pearson_r(&average_ranks(xs), &average_ranks(ys))
+}
+
+/// (Spearman rho, Theil Sen slope) of response length against payload length
+/// when reflection is detected. Both estimators selected so a few off-line
+/// responses (giant error dumps, truncated reflection) don't drag the
+/// correlation through the threshold for the rest of the family, which was 
+/// an issue with raw Pearson/OLS. The slope covers decoders too, where the 
+/// reflected length is a fraction of the payload length.
 fn reflection_regression(features: &[&ResponseFeatures]) -> Option<(f64, f64)> {
-    let pairs: Vec<(f64, f64)> = features
-        .iter()
-        .map(|f| (payload_len(f), f.response_length as f64))
-        .collect();
-    let n = pairs.len() as f64;
+    let payload_lens: Vec<f64> = features.iter().map(|f| payload_len(f)).collect();
+    let response_lens: Vec<f64> = features.iter().map(|f| f.response_length as f64).collect();
+
+    let rho = spearman_rho(&payload_lens, &response_lens)?;
+    if rho < REFLECTION_CORRELATION_THRESHOLD {
+        return None;
+    }
+
+    Some((rho, theil_sen_slope(&payload_lens, &response_lens)))
+}
+
+/// Pearson correlation of paired values; None when undefined (fewer than
+/// two points, or zero variance on either axis).
+fn pearson_r(xs: &[f64], ys: &[f64]) -> Option<f64> {
+    let n = xs.len() as f64;
     if n < 2.0 {
         return None;
     }
-    let mean_x = pairs.iter().map(|&(x, _)| x).sum::<f64>() / n;
-    let mean_y = pairs.iter().map(|&(_, y)| y).sum::<f64>() / n;
-    let var_x = pairs
+    let mean_x = xs.iter().sum::<f64>() / n;
+    let mean_y = ys.iter().sum::<f64>() / n;
+    let var_x = xs
         .iter()
-        .map(|&(x, _)| (x - mean_x).powi(2))
+        .map(|x| (x - mean_x).powi(2))
         .sum::<f64>()
         / n;
-    let var_y = pairs
+    let var_y = ys
         .iter()
-        .map(|&(_, y)| (y - mean_y).powi(2))
+        .map(|y| (y - mean_y).powi(2))
         .sum::<f64>()
         / n;
     if var_x == 0.0 || var_y == 0.0 {
         return None;
     }
-    let cov = pairs
+    let cov = xs
         .iter()
-        .map(|&(x, y)| (x - mean_x) * (y - mean_y))
+        .zip(ys)
+        .map(|(x, y)| (x - mean_x) * (y - mean_y))
         .sum::<f64>()
         / n;
-    let r = cov / (var_x.sqrt() * var_y.sqrt());
-    if r < REFLECTION_CORRELATION_THRESHOLD {
-        return None;
+    Some(cov / (var_x.sqrt() * var_y.sqrt()))
+}
+
+/// 1-based ranks with ties averaged, (Pearson on ranks is Spearman)
+fn average_ranks(values: &[f64]) -> Vec<f64> {
+    let mut order: Vec<usize> = (0..values.len()).collect();
+    order.sort_by(|&a, &b| values[a].partial_cmp(&values[b]).unwrap());
+    let mut ranks = vec![0.0; values.len()];
+    let mut i = 0;
+    while i < order.len() {
+        let mut j = i;
+        while j + 1 < order.len() && values[order[j + 1]] == values[order[i]] {
+            j += 1;
+        }
+        let rank = (i + j) as f64 / 2.0 + 1.0;
+        for &idx in &order[i..=j] {
+            ranks[idx] = rank;
+        }
+        i = j + 1;
     }
-    Some((r, cov / var_x))
+    ranks
+}
+
+/// Theil-Sen slope: the median of all pairwise slopes. 
+fn theil_sen_slope(xs: &[f64], ys: &[f64]) -> f64 {
+    const MAX_POINTS: usize = 8192; // Max points for theil-sen to keep memory pressure manageable
+                                    // with longer wordlists. Kicks in stride sampling if a status
+                                    // code family has more than 8192 members in it.
+    let step = xs.len().div_ceil(MAX_POINTS).max(1);
+    let points: Vec<(f64, f64)> = (0..xs.len())
+        .step_by(step)
+        .map(|i| (xs[i], ys[i]))
+        .collect();
+    let mut slopes = Vec::with_capacity(points.len() * (points.len() - 1) / 2);
+    for i in 0..points.len() {
+        for j in (i + 1)..points.len() {
+            let dx = points[j].0 - points[i].0;
+            if dx != 0.0 {
+                slopes.push((points[j].1 - points[i].1) / dx);
+            }
+        }
+    }
+    if slopes.is_empty() {
+        // All sampled payload lengths are equal meaning nothing to regress out
+        return 0.0;
+    }
+    slopes.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    slopes[slopes.len() / 2]
 }
 
 /// Response length with the reflected payload component removed.
@@ -858,10 +935,18 @@ pub fn analyze_clusters(result: &DbscanResult, ttfb_ref: Option<(u16, f64, f64)>
     }
 
     for (status, r) in &result.reflection {
-        observations.push(format!(
-            "Reflection detected on status {} (r = {:.2})",
-            status, r
-        ));
+        // Slope is the reflection factor: response bytes per payload byte (3.0
+        // means the input lands in the output three times).
+        match result.reflection_slopes.get(status) {
+            Some(&slope) => observations.push(format!(
+                "Reflection detected on status {} (rho = {:.2}, slope = {:.1})",
+                status, r, slope
+            )),
+            None => observations.push(format!(
+                "Reflection detected on status {} (rho = {:.2})",
+                status, r
+            )),
+        }
     }
 
     if result.clusters.len() == 1 && result.noise_count == 0 {
@@ -918,6 +1003,35 @@ pub fn analyze_clusters(result: &DbscanResult, ttfb_ref: Option<(u16, f64, f64)>
             .collect();
 
         observations.push(format!("    Length: {} bytes", describe_range(&lengths)));
+
+        if let Some(&slope) = result.reflection_slopes.get(&cluster.centroid.mode_status_code) {
+            // Reflecting family: also show the reflection residual (length with the
+            // fitted reflection subtracted), on top of the raw lengths above. A
+            // perfectly uniform residual means every member wa reflected
+            // verbatim; any spread is members that were not, behaviour that
+            // may sit inside the cluster without reaching the outlier bar.
+            let residuals: Vec<f64> = cluster
+                .features
+                .iter()
+                .map(|f| f.response_length as f64 - slope * payload_len(f))
+                .collect();
+            let min = residuals.iter().cloned().fold(f64::INFINITY, f64::min);
+            let max = residuals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            if max - min < 1.0 {
+                observations.push(format!(
+                    "    Reflection residual: {} bytes (uniform)",
+                    min.round()
+                ));
+            } else {
+                let mean = residuals.iter().sum::<f64>() / residuals.len() as f64;
+                observations.push(format!(
+                    "    Reflection residual: mean {}, min {}, max {} bytes",
+                    mean.round(),
+                    min.round(),
+                    max.round()
+                ));
+            }
+        }
         observations.push(format!("    TTFB:   {} ms", describe_range(&ttfbs)));
 
         for payload in &cluster.sample_payloads {
@@ -1432,7 +1546,9 @@ mod tests {
         for i in 0..4 {
             features.push(feat(500, 200, 40, 20, 2, &format!("err-{}", i)));
         }
-        features.push(feat(500, 9000, 40, 20, 2, "far-500")); // response index 8
+        // Same-length payload as the other 500s, so the family is not
+        // reflective and the length outlier is judged on raw length.
+        features.push(feat(500, 9000, 40, 20, 2, "far50")); // response index 8
 
         let result = perform_clustering(&features, 1.0, 3, 6, true, None, 0.0);
         assert_eq!(result.outliers, vec![8]);
@@ -1475,5 +1591,83 @@ mod tests {
 
         assert_eq!(result.clusters.len(), 3);
         assert_eq!(result.noise_count, 0);
+    }
+
+    /// y = 600 + 3x, with the payload itself providing the length.
+    fn reflected_features(count: usize) -> Vec<ResponseFeatures> {
+        (1..=count)
+            .map(|x| feat(200, 600 + 3 * x, 100, 100, 10, &"a".repeat(x)))
+            .collect()
+    }
+
+    fn refs(features: &[ResponseFeatures]) -> Vec<&ResponseFeatures> {
+        features.iter().collect()
+    }
+
+    #[test]
+    fn reflection_is_detected_and_slope_recovered() {
+        let features = reflected_features(50);
+        let (rho, slope) = reflection_regression(&refs(&features)).expect("detected");
+        assert!(rho > REFLECTION_CORRELATION_THRESHOLD);
+        assert!((slope - 3.0).abs() < 0.1);
+    }
+
+    #[test]
+    fn giant_responses_do_not_disable_reflection() {
+        let mut features = reflected_features(200);
+        // Two ~250KB error dumps on 1-byte payloads.
+        features.push(feat(200, 250_000, 100, 50, 40, "1"));
+        features.push(feat(200, 249_000, 100, 50, 40, "2"));
+        let (rho, slope) = reflection_regression(&refs(&features)).expect("still detected");
+        assert!(rho > REFLECTION_CORRELATION_THRESHOLD);
+        assert!((slope - 3.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn length_capped_reflection_is_still_detected() {
+        // Payloads beyond 255 chars reflect at a constant length.
+        let features: Vec<ResponseFeatures> = (1..=300)
+            .map(|x| feat(200, 600 + 3 * x.min(255), 100, 100, 10, &"a".repeat(x)))
+            .collect();
+        let (rho, slope) = reflection_regression(&refs(&features)).expect("still detected");
+        assert!(rho > REFLECTION_CORRELATION_THRESHOLD);
+        assert!((slope - 3.0).abs() < 0.5);
+    }
+
+    #[test]
+    fn constant_length_is_not_reflection() {
+        let features: Vec<ResponseFeatures> = (1..=20)
+            .map(|x| feat(200, 500, 100, 100, 10, &"a".repeat(x)))
+            .collect();
+        assert!(reflection_regression(&refs(&features)).is_none());
+    }
+
+    #[test]
+    fn reflecting_cluster_reports_uniform_residual() {
+        let features = reflected_features(30);
+        let result = perform_clustering(&features, 1.0, 3, 6, true, None, 0.0);
+        let obs = analyze_clusters(&result, None);
+        assert!(
+            obs.iter().any(|l| l.contains("Reflection residual: 600 bytes (uniform)")),
+            "expected uniform reflection residual line, got: {:?}",
+            obs
+        );
+    }
+
+    #[test]
+    fn reflecting_cluster_reports_residual_spread() {
+        let mut features = reflected_features(30);
+        // One member echoes 200 bytes short of the line. Wide enough
+        // tolerance that it stays inside the cluster, where the
+        // residual spread gives it away.
+        features.push(feat(200, 700, 100, 100, 10, &"a".repeat(100)));
+        let result = perform_clustering(&features, 6.0, 3, 6, true, None, 0.0);
+        let obs = analyze_clusters(&result, None);
+        assert!(
+            obs.iter()
+                .any(|l| l.starts_with("    Reflection residual: mean") && l.contains("min 400")),
+            "expected residual spread line, got: {:?}",
+            obs
+        );
     }
 }
