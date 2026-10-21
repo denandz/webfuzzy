@@ -77,7 +77,7 @@ The above shows a stable 200 response, a 404 response that has variable content 
 
 Current features used for clustering are:
 
-- Status Code - applied categorically, clustering is run per-status code since a difference of HTTP/200 and HTTP/201 is a very meaningful difference for an API. Euclidian distance between response data points for HTTP/200 and HTTP/201, for example, shouldn't be clustered together.
+- Status Code - applied categorically, clustering is run per-status code since a difference of HTTP/200 and HTTP/201 is a very meaningful difference for an API. Euclidian distance between response data points for HTTP/200 and HTTP/201, for example, shouldn't be clustered together. When the code and this readme reference a 'status code family' or 'family', this is what it's talking about.
 - Response content length in bytes.
 - Time-to-first byte timing data.
 - Response content word count.
@@ -89,11 +89,27 @@ These raw values are not directly comparable (bytes vs milliseconds vs counts), 
 Two further adjustments keep the length and timing features from producing false outliers:
 
 - TTFB jitter scaling. Timing on a fast network is dominated by millisecond-scale wobble. The family that matches the baseline's mode status is scaled against the baseline's own mean and standard deviation (a control group of un-injected requests), and every family's TTFB standard deviation is floored at `--timing-jitter` (default 50 ms). TLDR: by default we don't really cluster on timing thats less than ~50ms of wobbly.
-- Reflection regression. An endpoint that reflects the input payload (think reflected XSS) makes response length track payload length, which fragments the clusters into one point per payload length. When the Pearson correlation between payload length and response length within a family reaches 0.8, the length feature is replaced by the regression residual (`content_length - slope * payload_length`); the slope covers decoders as well, where the reflected length is a fraction of the payload length. Word and line counts are driven by the reflected payload too, and the server's exact mapping is unknown, so they are squashed to zero for that family.
+- Reflection regression. An endpoint that reflects the input payload (think reflected XSS) makes response length track payload length, which fragments the clusters into one point per payload length. When reflection is detected within a family, the length feature is replaced by the regression residual (`content_length - slope * payload_length`) and word/line counts are squashed to zero. See [Reflecting Endpoints](#reflecting-endpoints) for how detection and the slope work.
 
 A deliberate side effect of the reflection handling: payloads whose encoding the server transforms (heavy percent-encoding, charset tricks) decode to a different fraction than the population average and keep a residual, surfacing as small clusters or outliers. This is intentional! These are the payloads worth a human look since they indicate some form of encoding/decoding behaviour that's worth investigating!
 
 The goal is 'weird handling of data, or odd encoding' gets its own cluster or gets flagged as an outlier.
+
+# Reflecting Endpoints
+
+If the endpoint reflects the input (reflected XSS being the classic vulnerability case), response length grows with payload length. This disrupts the clustering since content length is going to change depending on the input length, and small interesting deviations are hidden in the noise. So webfuzzy detects and measures reflection, subtracts it from the response length, and clusters on what is left over (the "residual"). Two estimators are involved:
+
+**Spearman rank correlation (rho) - "does the response track my payload?"** For each status code, webfuzzy ranks the payload lengths and the response lengths, and correlates the ranks (Spearman correlation). The result is a single number from -1 to 1: how consistently the longer payloads get the longer responses. 0.8 or more is judged as reflecting (though this was picked as an arbitrary starting point, and may change with more testing). This is the number you see in the summary line (`Payload-response correlation (HIGH...): 0.88`) and in the report (`Reflection detected on status 200 (rho = 0.89)`
+
+Spearman was chosen since it's robust to outliers. One payload that triggers a 250KB stack-trace dump only takes a single rank slot at the top of the list. A plain (Pearson) correlation didnt tolerate that condition and a few giant error pages among ~1100 responses would drag the number from 0.99 down to like 0.02, the tool would conclude "no reflection", and the analysis would silently go wrong. Spearman is resilient to this condition.
+
+**Theil-Sen slope - Identifying the size of the reflection** Only applied for status code families where reflection was detected. This is the median of the slopes between all pairs of (payload length, response length) points, in response bytes per payload byte. Read this number as information about the target reflection behavior in general. A slope of ~3 says the input is written into the response in three places; a slope of ~0.5 says the server transforms it (decodes, re-encodes, strips) before echoing it back. This slope is calculated as a single number for each status code family and used in the residual calculation (the "slope").
+
+The tool subtracts `slope * payload_length` from every response length. What remains is the residual. The part of the response that doesn't contain the reflected payload. Payloads that are echoed cleanly all land at the same residual, so a thousand reflected responses of every size form one cluster. Anything that deviates (input that was truncated, encoding that was transformed, an error page that grew) all keep a residual and show up as an outlier with a sigma tag.
+
+Each reflecting cluster also reports the residual spread across its members in the webfuzzy output (eg `Reflection residual: mean 598, min -7040, max 622 bytes`): a uniform residual (all values the same) means every input payload was reflected in the same way, while a spread of values shows variance in the clusters members. A spread (different mean,min,max values) could indicate the cluster includes anomalies too mild to become outliers or new clusters themselves! If you see a spread here, it could mean some kind of minor encoding processing differences in the target, or additional data getting appended for a given input. Major differences should form their own clusters either way, but the reflection residual numbers help catch more nuanced endpoint behavior. If you see variance in the residual numbers, it could be worth investigating that cluster's payloads more closely to understand what transformation is happening.
+
+Word and line count features are squashed to zero for reflecting status code families, since the reflected payload drives them too and the server's mapping is unknown.
 
 # License
 
