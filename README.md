@@ -45,7 +45,7 @@ Options:
   -v, --verbose
           Verbose output
       --max-clusters <MAX_CLUSTERS>
-          Maximum number of clusters to report [default: 6]
+          Maximum number of clusters to report (0 = no limit: report however many clusters DBSCAN finds)
       --disable-timing
           Disable timing analysis
       --timing-jitter <TIMING_JITTER>ms

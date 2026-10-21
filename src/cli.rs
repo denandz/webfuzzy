@@ -67,8 +67,9 @@ pub struct Args {
     #[arg(short, long)]
     pub verbose: bool,
 
-    /// Maximum number of clusters to report
-    #[arg(long, default_value = "6")]
+    /// Maximum number of clusters to report (0 = no limit: report
+    /// however many clusters DBSCAN finds)
+    #[arg(long, default_value = "0")]
     pub max_clusters: usize,
 
     /// Disable timing analysis

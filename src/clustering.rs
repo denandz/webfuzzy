@@ -277,8 +277,9 @@ pub fn perform_clustering(
             .cmp(&final_clusters[a].features.len())
     });
 
-    // Global max_clusters cap: demote the smallest clusters to outliers.
-    if order.len() > max_clusters {
+    // Global max_clusters cap (0 = unlimited): demote the smallest
+    // clusters to outliers.
+    if max_clusters > 0 && order.len() > max_clusters {
         for &c in order.iter().skip(max_clusters) {
             outliers.extend(cluster_members[c].iter().copied());
         }
