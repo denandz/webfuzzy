@@ -22,7 +22,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return replay::run_replay(args, report_path);
     }
 
-    let url = args.url.clone()
+    let url = args
+        .url
+        .clone()
         .ok_or("either --url (live scan) or --report <file> (offline re-analysis) is required")?;
 
     println!("{}", "Webfuzzy - Web Request Fuzzer");
@@ -104,10 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         target_url: url.clone(),
         method: method.to_string(),
         start_time: config.started_at.clone(),
-        end_time: Some(
-            chrono::Utc::now()
-                .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        ),
+        end_time: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true)),
         arguments: std::env::args().collect(),
     };
     match audit_logger.save_report(&scan_info, &baseline_results, &fuzz_result) {

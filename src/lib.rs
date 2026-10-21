@@ -1,10 +1,10 @@
-pub mod cli;
-pub mod logging;
-pub mod http_client;
-pub mod encoding;
 pub mod baseline;
-pub mod marker;
-pub mod fuzzing;
+pub mod cli;
 pub mod clustering;
-pub mod reporting;
+pub mod encoding;
+pub mod fuzzing;
+pub mod http_client;
+pub mod logging;
+pub mod marker;
 pub mod replay;
+pub mod reporting;

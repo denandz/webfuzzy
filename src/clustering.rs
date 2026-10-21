@@ -33,7 +33,7 @@ pub struct DbscanResult {
     #[serde(default)]
     pub reflection: Vec<(u16, f64)>,
     /// Theil-Sen slope (response bytes per payload byte) of each reflecting
-    /// status code family, so reports can show the reflection residual 
+    /// status code family, so reports can show the reflection residual
     /// inside its clusters.
     #[serde(default)]
     pub reflection_slopes: BTreeMap<u16, f64>,
@@ -241,8 +241,7 @@ pub fn perform_clustering(
         // Size desc, ties by DBSCAN label: HashMap iteration order is
         // random, and without the tie-break equal-size clusters (and their
         // ids, and max_clusters demotion) would shuffle between runs.
-        cluster_results
-            .sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+        cluster_results.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
 
         for (_orig_label, indices) in cluster_results {
             let cluster_features: Vec<ResponseFeatures> =
@@ -352,7 +351,7 @@ fn payload_len(feature: &ResponseFeatures) -> f64 {
 }
 
 /// Spearman rank correlation of paired values; None when undefined (fewer
-/// than two points, or zero variance on either axis). Used for both the 
+/// than two points, or zero variance on either axis). Used for both the
 /// the per-family reflection gate and the run-level summary, so the
 /// two report the same estimator. Spearman == ranked Pearson
 pub fn spearman_rho(xs: &[f64], ys: &[f64]) -> Option<f64> {
@@ -362,8 +361,8 @@ pub fn spearman_rho(xs: &[f64], ys: &[f64]) -> Option<f64> {
 /// (Spearman rho, Theil Sen slope) of response length against payload length
 /// when reflection is detected. Both estimators selected so a few off-line
 /// responses (giant error dumps, truncated reflection) don't drag the
-/// correlation through the threshold for the rest of the family, which was 
-/// an issue with raw Pearson/OLS. The slope covers decoders too, where the 
+/// correlation through the threshold for the rest of the family, which was
+/// an issue with raw Pearson/OLS. The slope covers decoders too, where the
 /// reflected length is a fraction of the payload length.
 fn reflection_regression(features: &[&ResponseFeatures]) -> Option<(f64, f64)> {
     let payload_lens: Vec<f64> = features.iter().map(|f| payload_len(f)).collect();
@@ -386,16 +385,8 @@ fn pearson_r(xs: &[f64], ys: &[f64]) -> Option<f64> {
     }
     let mean_x = xs.iter().sum::<f64>() / n;
     let mean_y = ys.iter().sum::<f64>() / n;
-    let var_x = xs
-        .iter()
-        .map(|x| (x - mean_x).powi(2))
-        .sum::<f64>()
-        / n;
-    let var_y = ys
-        .iter()
-        .map(|y| (y - mean_y).powi(2))
-        .sum::<f64>()
-        / n;
+    let var_x = xs.iter().map(|x| (x - mean_x).powi(2)).sum::<f64>() / n;
+    let var_y = ys.iter().map(|y| (y - mean_y).powi(2)).sum::<f64>() / n;
     if var_x == 0.0 || var_y == 0.0 {
         return None;
     }
@@ -428,11 +419,11 @@ fn average_ranks(values: &[f64]) -> Vec<f64> {
     ranks
 }
 
-/// Theil-Sen slope: the median of all pairwise slopes. 
+/// Theil-Sen slope: the median of all pairwise slopes.
 fn theil_sen_slope(xs: &[f64], ys: &[f64]) -> f64 {
     const MAX_POINTS: usize = 8192; // Max points for theil-sen to keep memory pressure manageable
-                                    // with longer wordlists. Kicks in stride sampling if a status
-                                    // code family has more than 8192 members in it.
+    // with longer wordlists. Kicks in stride sampling if a status
+    // code family has more than 8192 members in it.
     let step = xs.len().div_ceil(MAX_POINTS).max(1);
     let points: Vec<(f64, f64)> = (0..xs.len())
         .step_by(step)
@@ -1005,7 +996,10 @@ pub fn analyze_clusters(result: &DbscanResult, ttfb_ref: Option<(u16, f64, f64)>
 
         observations.push(format!("    Length: {} bytes", describe_range(&lengths)));
 
-        if let Some(&slope) = result.reflection_slopes.get(&cluster.centroid.mode_status_code) {
+        if let Some(&slope) = result
+            .reflection_slopes
+            .get(&cluster.centroid.mode_status_code)
+        {
             // Reflecting family: also show the reflection residual (length with the
             // fitted reflection subtracted), on top of the raw lengths above. A
             // perfectly uniform residual means every member wa reflected
@@ -1304,11 +1298,13 @@ mod tests {
         for _ in 0..25 {
             let again = perform_clustering(&features, 1.0, 3, 6, true, None, 50.0);
             assert_eq!(
-                again.clusters
+                again
+                    .clusters
                     .iter()
                     .map(|c| (c.id, c.features[0].content_type.clone()))
                     .collect::<Vec<_>>(),
-                result.clusters
+                result
+                    .clusters
                     .iter()
                     .map(|c| (c.id, c.features[0].content_type.clone()))
                     .collect::<Vec<_>>(),
@@ -1649,7 +1645,8 @@ mod tests {
         let result = perform_clustering(&features, 1.0, 3, 6, true, None, 0.0);
         let obs = analyze_clusters(&result, None);
         assert!(
-            obs.iter().any(|l| l.contains("Reflection residual: 600 bytes (uniform)")),
+            obs.iter()
+                .any(|l| l.contains("Reflection residual: 600 bytes (uniform)")),
             "expected uniform reflection residual line, got: {:?}",
             obs
         );

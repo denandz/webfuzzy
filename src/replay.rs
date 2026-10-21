@@ -130,8 +130,8 @@ pub fn run_replay(args: &Args, path: &Path) -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
     use crate::http_client::ResponseFeatures;
-    use std::path::PathBuf;
     use std::collections::HashMap;
+    use std::path::PathBuf;
 
     /// Scratch dir removed on drop (avoids a `tempfile` dev-dependency).
     struct TmpDir(PathBuf);
